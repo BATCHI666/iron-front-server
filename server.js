@@ -1,3 +1,4 @@
+
 const { WebSocketServer, WebSocket } = require("ws");
 const { randomUUID } = require("crypto");
 const fs = require("fs");
@@ -84,6 +85,35 @@ function profileFor(gameId) {
   return socialProfiles.get(String(gameId)) || null;
 }
 
+function profileWithPresence(gameId) {
+  const profile = profileFor(gameId);
+  if (!profile) return null;
+
+  const live = idToClient.get(String(gameId));
+  const room = live?.roomId ? rooms.get(live.roomId) : null;
+
+  let activity = live?.activity || "В меню";
+
+  if (room) {
+    activity = room.started
+      ? "В сетевом бою"
+      : "В комнате ожидания";
+  }
+
+  return {
+    ...profile,
+    online: Boolean(live && live.ws.readyState === WebSocket.OPEN),
+    activity:
+      live && live.ws.readyState === WebSocket.OPEN
+        ? activity
+        : "Не в сети",
+    roomId: room?.id || null,
+    roomName: room?.name || null,
+    roomStarted: Boolean(room?.started),
+    roomHasPassword: Boolean(room?.password)
+  };
+}
+
 function send(ws, data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(data));
@@ -98,11 +128,11 @@ function sendFriendLists(client) {
   if (!client.gameId) return;
 
   const friends = [...getSet(friendships, client.gameId)]
-    .map(profileFor)
+    .map(profileWithPresence)
     .filter(Boolean);
 
   const requests = [...getSet(friendRequests, client.gameId)]
-    .map(profileFor)
+    .map(profileWithPresence)
     .filter(Boolean);
 
   send(client.ws, { type: "friendsList", friends });
@@ -112,6 +142,16 @@ function sendFriendLists(client) {
 function pushFriendLists(gameId) {
   const client = idToClient.get(String(gameId));
   if (client) sendFriendLists(client);
+}
+
+function refreshFriendsOf(gameId) {
+  if (!gameId) return;
+
+  for (const friendId of getSet(friendships, String(gameId))) {
+    pushFriendLists(friendId);
+  }
+
+  pushFriendLists(String(gameId));
 }
 
 function broadcastRoom(room, data, exceptId = null) {
@@ -169,6 +209,13 @@ function updateRoom(room) {
   for (const client of clients.values()) {
     if (!client.roomId) sendRooms(client.ws);
   }
+
+  for (const player of room.players.values()) {
+    const memberClient = clients.get(player.id);
+    if (memberClient?.gameId) {
+      refreshFriendsOf(memberClient.gameId);
+    }
+  }
 }
 
 function leaveRoom(client) {
@@ -205,6 +252,10 @@ function leaveRoom(client) {
   }
 
   send(client.ws, { type: "left" });
+
+  if (client.gameId) {
+    refreshFriendsOf(client.gameId);
+  }
 }
 
 function joinRoom(client, requestedId, password = "") {
@@ -265,6 +316,8 @@ function joinRoom(client, requestedId, password = "") {
   }, client.id);
 
   updateRoom(room);
+
+  if (client.gameId) refreshFriendsOf(client.gameId);
 
   if (room.started) {
     const players = [...room.players.values()].map((p, index) => ({
@@ -332,6 +385,11 @@ function startGame(client) {
   });
 
   updateRoom(room);
+
+  for (const p of room.players.values()) {
+    const c = clients.get(p.id);
+    if (c?.gameId) refreshFriendsOf(c.gameId);
+  }
 }
 
 function handleMessage(client, message) {
@@ -381,6 +439,7 @@ function handleMessage(client, message) {
       });
 
       sendFriendLists(client);
+      refreshFriendsOf(client.gameId);
 
       if (client.gameId) {
         for (const requesterId of getSet(friendRequests, client.gameId)) {
@@ -409,6 +468,83 @@ function handleMessage(client, message) {
       socialProfiles.set(client.gameId, profile);
       persistSocial();
       sendFriendLists(client);
+      refreshFriendsOf(client.gameId);
+      break;
+    }
+
+    case "presenceUpdate": {
+      const allowed = new Set([
+        "В меню",
+        "Одиночная игра",
+        "Мультиплеер"
+      ]);
+
+      if (allowed.has(String(message.activity || ""))) {
+        client.activity = String(message.activity);
+      }
+
+      if (client.gameId) refreshFriendsOf(client.gameId);
+      break;
+    }
+
+    case "friendJoin": {
+      const targetId = String(message.gameId || "");
+
+      if (
+        !client.gameId ||
+        !getSet(friendships, client.gameId).has(targetId)
+      ) {
+        send(client.ws, {
+          type: "friendJoinResult",
+          ok: false,
+          message: "Зайти можно только к игроку из списка друзей."
+        });
+        return;
+      }
+
+      const target = idToClient.get(targetId);
+
+      if (!target || target.ws.readyState !== WebSocket.OPEN) {
+        send(client.ws, {
+          type: "friendJoinResult",
+          ok: false,
+          message: "Друг сейчас не в сети."
+        });
+        return;
+      }
+
+      const targetRoom = target.roomId
+        ? rooms.get(target.roomId)
+        : null;
+
+      if (!targetRoom) {
+        send(client.ws, {
+          type: "friendJoinResult",
+          ok: false,
+          message: "Друг сейчас не в сетевой комнате. Он может играть в одиночном режиме или находиться в меню."
+        });
+        return;
+      }
+
+      if (
+        targetRoom.players.size >= targetRoom.maxPlayers &&
+        !targetRoom.players.has(client.id)
+      ) {
+        send(client.ws, {
+          type: "friendJoinResult",
+          ok: false,
+          message: "Комната друга заполнена."
+        });
+        return;
+      }
+
+      send(client.ws, {
+        type: "friendRoomFound",
+        roomId: targetRoom.id,
+        roomName: targetRoom.name,
+        hasPassword: Boolean(targetRoom.password),
+        started: Boolean(targetRoom.started)
+      });
       break;
     }
 
@@ -435,7 +571,10 @@ function handleMessage(client, message) {
       send(client.ws, {
         type: "friendSearchResult",
         id: gameId,
-        profile: profile && gameId !== client.gameId ? profile : null
+        profile:
+          profile && gameId !== client.gameId
+            ? profileWithPresence(gameId)
+            : null
       });
       break;
     }
@@ -520,10 +659,12 @@ function handleMessage(client, message) {
       getSet(friendRequests, client.gameId).delete(fromId);
       getSet(friendships, client.gameId).add(fromId);
       getSet(friendships, fromId).add(client.gameId);
-
       persistSocial();
 
-      send(client.ws, { type: "friendAccepted", gameId: fromId });
+      send(client.ws, {
+        type: "friendAccepted",
+        gameId: fromId
+      });
 
       const fromClient = idToClient.get(fromId);
 
@@ -562,7 +703,10 @@ function handleMessage(client, message) {
       getSet(friendships, friendId).delete(client.gameId);
       persistSocial();
 
-      send(client.ws, { type: "friendRemoved", gameId: friendId });
+      send(client.ws, {
+        type: "friendRemoved",
+        gameId: friendId
+      });
 
       pushFriendLists(client.gameId);
       pushFriendLists(friendId);
@@ -685,9 +829,10 @@ function handleMessage(client, message) {
           ? Math.max(1, Math.min(1000, p.maxHp))
           : 100,
         name: client.name,
-        color: typeof p.color === "string"
-          ? p.color.slice(0, 24)
-          : "#829f60"
+        color:
+          typeof p.color === "string"
+            ? p.color.slice(0, 24)
+            : "#829f60"
       };
 
       client.player = playerState;
@@ -709,7 +854,9 @@ function handleMessage(client, message) {
       if (!room || !room.started) return;
 
       const numberOr = (v, fallback = 0) =>
-        typeof v === "number" && Number.isFinite(v) ? v : fallback;
+        typeof v === "number" && Number.isFinite(v)
+          ? v
+          : fallback;
 
       broadcastRoom(room, {
         type: "shoot",
@@ -758,7 +905,8 @@ wss.on("connection", ws => {
     name: "Игрок_" + id.slice(0, 4),
     gameId: null,
     roomId: null,
-    player: null
+    player: null,
+    activity: "В меню"
   };
 
   clients.set(id, client);
@@ -789,6 +937,7 @@ wss.on("connection", ws => {
       idToClient.get(client.gameId) === client
     ) {
       idToClient.delete(client.gameId);
+      refreshFriendsOf(client.gameId);
     }
   });
 
