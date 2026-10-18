@@ -15,7 +15,9 @@ const friendships = new Map();
 const friendRequests = new Map();
 const directMessages = new Map();
 const dmReadAt = new Map();
-const SOCIAL_DB = path.join(__dirname, "social-data.json");
+const DATA_DIR = process.env.IRONFRONT_DATA_DIR || __dirname;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+const SOCIAL_DB = path.join(DATA_DIR, "social-data.json");
 function loadSocialData() {
   try {
     const data = JSON.parse(fs.readFileSync(SOCIAL_DB, "utf8"));
@@ -35,7 +37,9 @@ function persistSocial() {
       directMessages: [...directMessages.entries()],
       dmReadAt: [...dmReadAt.entries()]
     };
-    fs.writeFileSync(SOCIAL_DB, JSON.stringify(data), "utf8");
+    const tmp = SOCIAL_DB + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(data), "utf8");
+    fs.renameSync(tmp, SOCIAL_DB);
   } catch (error) { console.error("Не удалось сохранить данные друзей:", error.message); }
 }
 loadSocialData();
@@ -58,8 +62,7 @@ function profileFor(gameId) { return socialProfiles.get(String(gameId)) || null;
 function dmKey(a, b) { return [String(a), String(b)].sort().join(":"); }
 function areFriends(a, b) { return getSet(friendships, String(a)).has(String(b)); }
 function profileWithPresence(gameId) {
-  const profile = profileFor(gameId);
-  if (!profile) return null;
+  const profile = profileFor(gameId) || { gameId: String(gameId), name: "Игрок " + String(gameId), level: 1, xp: 0, kills: 0, deaths: 0, matches: 0, created: new Date().toISOString(), tankColor: "#829f60" };
   const live = idToClient.get(String(gameId));
   const room = live?.roomId ? rooms.get(live.roomId) : null;
   let activity = live?.activity || "В меню";
@@ -142,7 +145,6 @@ function roomInfo(room) {
 function sendRooms(ws) {
   // Показываем и уже начавшиеся комнаты: в них можно подключиться к текущему бою.
   const list = [...rooms.values()]
-    .filter(room => room.players.size < room.maxPlayers)
     .map(roomInfo);
 
   send(ws, { type: "rooms", rooms: list });
@@ -411,7 +413,15 @@ function handleMessage(client, message) {
       }
       dmReadAt.set(`${client.gameId}:${otherId}`, Date.now());
       persistSocial();
-      send(client.ws, { type: "friendConversation", withGameId: otherId, messages: directMessages.get(dmKey(client.gameId, otherId)) || [] });
+      send(client.ws, { type: "friendConversation", withGameId: otherId, requestId: String(message.requestId || "").slice(0, 80), messages: directMessages.get(dmKey(client.gameId, otherId)) || [] });
+      break;
+    }
+    case "friendMarkRead": {
+      const otherId = String(message.withGameId || "");
+      if (!client.gameId || !/^\d{9}$/.test(otherId) || !areFriends(client.gameId, otherId)) return;
+      dmReadAt.set(`${client.gameId}:${otherId}`, Date.now());
+      persistSocial();
+      send(client.ws, { type: "friendReadMarked", withGameId: otherId });
       break;
     }
     case "friendMessage": {
@@ -420,13 +430,13 @@ function handleMessage(client, message) {
       if (!client.gameId || !/^\d{9}$/.test(toId) || !areFriends(client.gameId, toId) || !body) {
         send(client.ws, { type: "friendError", message: "Сообщения можно отправлять только друзьям." }); return;
       }
-      const entry = { fromGameId: client.gameId, toGameId: toId, fromName: client.name, message: body, createdAt: new Date().toISOString() };
+      const entry = { messageId: randomUUID(), fromGameId: client.gameId, toGameId: toId, fromName: client.name, message: body, createdAt: new Date().toISOString() };
       const key = dmKey(client.gameId, toId);
       const history = directMessages.get(key) || [];
       history.push(entry);
       directMessages.set(key, history.slice(-300));
       persistSocial();
-      send(client.ws, { type: "friendMessageSent", toGameId: toId, message: body, createdAt: entry.createdAt, requestId: String(message.requestId || "").slice(0, 80) });
+      send(client.ws, { type: "friendMessageSent", ...entry, toGameId: toId, requestId: String(message.requestId || "").slice(0, 80) });
       const target = idToClient.get(toId);
       if (target && target.ws.readyState === WebSocket.OPEN) send(target.ws, { type: "friendMessageReceived", ...entry });
       break;
@@ -779,3 +789,5 @@ wss.on("listening", () => {
 wss.on("error", error => {
   console.error("Ошибка сервера:", error.message);
 });
+process.on("SIGTERM", () => { try { persistSocial(); } finally { wss.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1500).unref(); } });
+process.on("SIGINT", () => { try { persistSocial(); } finally { wss.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1500).unref(); } });
