@@ -1,4 +1,4 @@
-onst { WebSocketServer, WebSocket } = require("ws");
+const { WebSocketServer, WebSocket } = require("ws");
 const { randomUUID } = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -309,6 +309,7 @@ function startGame(client) {
   room.started = true;
   room.claimedCoins = new Set();
   room.claimedPickups = new Set();
+  room.chatMessageIds = new Set();
 
   const members = [...room.players.values()];
 
@@ -673,7 +674,7 @@ function handleMessage(client, message) {
     case "coinCollect": {
       const room = rooms.get(client.roomId);
       const coinId = Number(message.coinId);
-      if (!room || !room.started || !Number.isInteger(coinId) || coinId < 0 || coinId >= 22) return;
+      if (!room || !room.started || !Number.isInteger(coinId) || coinId < 0 || coinId > 10000) return;
       if (!room.claimedCoins) room.claimedCoins = new Set();
       if (room.claimedCoins.has(coinId)) return;
       room.claimedCoins.add(coinId);
@@ -685,8 +686,8 @@ function handleMessage(client, message) {
       const room = rooms.get(client.roomId);
       const kind = String(message.kind || "");
       const pickupId = Number(message.pickupId);
-      const maxId = kind === "armor" ? 3 : kind === "medkit" ? 6 : 0;
-      if (!room || !room.started || !maxId || !Number.isInteger(pickupId) || pickupId < 1 || pickupId > maxId) return;
+      const validKind = kind === "armor" || kind === "medkit";
+      if (!room || !room.started || !validKind || !Number.isInteger(pickupId) || pickupId < 1 || pickupId > 10000) return;
       if (!room.claimedPickups) room.claimedPickups = new Set();
       const key = `${kind}:${pickupId}`;
       if (room.claimedPickups.has(key)) return;
@@ -702,13 +703,20 @@ function handleMessage(client, message) {
         .slice(0, 180);
 
       if (!room || !text) return;
+      const clientMsgId = typeof message.clientMsgId === "string" ? message.clientMsgId.slice(0, 80) : "";
+      if (clientMsgId) {
+        if (!room.chatMessageIds) room.chatMessageIds = new Set();
+        if (room.chatMessageIds.has(clientMsgId)) return;
+        room.chatMessageIds.add(clientMsgId);
+        if (room.chatMessageIds.size > 2000) room.chatMessageIds.clear();
+      }
 
       broadcastRoom(room, {
         type: "chat",
         id: client.id,
         name: client.name,
         message: text,
-        clientMsgId: typeof message.clientMsgId === "string" ? message.clientMsgId.slice(0, 80) : ""
+        clientMsgId
       });
       break;
     }
