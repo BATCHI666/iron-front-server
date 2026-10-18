@@ -43,6 +43,19 @@ function persistSocial() {
   } catch (error) { console.error("Не удалось сохранить данные друзей:", error.message); }
 }
 loadSocialData();
+const LEADERBOARD_REFRESH_MS = 30 * 60 * 1000;
+let leaderboardCache = { topKills: [], topTime: [], updatedAt: 0 };
+function refreshLeaderboardCache(force = false) {
+  if (!force && leaderboardCache.updatedAt && Date.now() - leaderboardCache.updatedAt < LEADERBOARD_REFRESH_MS) return;
+  const all = [...socialProfiles.values()].filter(p => /^\d{9}$/.test(String(p.gameId)));
+  const safe = p => ({ gameId: String(p.gameId), name: String(p.name || "Игрок").slice(0, 16), kills: Math.max(0, Number(p.kills) || 0), playTimeSeconds: Math.max(0, Number(p.playTimeSeconds) || 0) });
+  leaderboardCache = {
+    topKills: all.map(safe).sort((a,b) => b.kills-a.kills || a.name.localeCompare(b.name)).slice(0,50),
+    topTime: all.map(safe).sort((a,b) => b.playTimeSeconds-a.playTimeSeconds || a.name.localeCompare(b.name)).slice(0,50),
+    updatedAt: Date.now()
+  };
+}
+setInterval(() => refreshLeaderboardCache(true), LEADERBOARD_REFRESH_MS).unref?.();
 function getSet(map, key) { if (!map.has(key)) map.set(key, new Set()); return map.get(key); }
 function cleanProfile(raw, gameId, fallbackName = "Игрок") {
   raw = raw && typeof raw === "object" ? raw : {};
@@ -54,6 +67,7 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
     kills: Math.max(0, Math.min(1e9, Number(raw.kills) || 0)),
     deaths: Math.max(0, Math.min(1e9, Number(raw.deaths) || 0)),
     matches: Math.max(0, Math.min(1e9, Number(raw.matches) || 0)),
+    playTimeSeconds: Math.max(0, Math.min(1e12, Number(raw.playTimeSeconds) || 0)),
     created: String(raw.created || new Date().toISOString()).slice(0, 40),
     tankColor: /^#[0-9a-f]{6}$/i.test(String(raw.tankColor || "")) ? String(raw.tankColor) : "#e51f2a"
   };
@@ -398,6 +412,12 @@ function handleMessage(client, message) {
       socialProfiles.set(client.gameId, profile);
       persistSocial();
       sendFriendLists(client);
+      // New profile statistics invalidate cache only when the 30-minute refresh window expires.
+      break;
+    }
+    case "getLeaderboard": {
+      refreshLeaderboardCache(false);
+      send(client.ws, { type: "leaderboard", ...leaderboardCache, selfGameId: client.gameId || null });
       break;
     }
     case "presenceUpdate": {
