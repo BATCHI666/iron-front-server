@@ -328,6 +328,10 @@ function startGame(client) {
   room.claimedCoins = new Set();
   room.claimedPickups = new Set();
   room.chatMessageIds = new Set();
+  room.shots = new Map();
+  room.hitPairs = new Set();
+  room.recentDamage = new Map();
+  room.deadPlayers = new Set();
 
   const members = [...room.players.values()];
 
@@ -688,27 +692,99 @@ function handleMessage(client, message) {
       const numberOr = (v, fallback = 0) =>
         typeof v === "number" && Number.isFinite(v) ? v : fallback;
 
+      const shotId = String(message.shotId || `${client.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`).slice(0, 120);
+      if (!room.shots) room.shots = new Map();
+      room.shots.set(shotId, { shooterId: client.id, createdAt: Date.now(), damage: Math.max(0, Math.min(100, numberOr(message.damage, 28))) });
+      if (room.shots.size > 4000) {
+        const cutoff = Date.now() - 15000;
+        for (const [id, shot] of room.shots) if (shot.createdAt < cutoff) room.shots.delete(id);
+      }
       broadcastRoom(room, {
         type: "shoot",
         id: client.id,
         playerId: client.id,
+        shotId,
         x: numberOr(message.x),
         y: numberOr(message.y),
         vx: numberOr(message.vx),
         vy: numberOr(message.vy),
-        damage: Math.max(0, Math.min(100, numberOr(message.damage, 20)))
+        damage: Math.max(0, Math.min(100, numberOr(message.damage, 28)))
       }, client.id);
+      break;
+    }
+
+    case "hit": {
+      const room = rooms.get(client.roomId);
+      const shotId = String(message.shotId || "").slice(0, 120);
+      const targetId = String(message.targetId || "");
+      const shot = room?.shots?.get(shotId);
+      if (!room || !room.started || !shot || Date.now() - shot.createdAt > 5000) return;
+      if (shot.shooterId === targetId || !room.players.has(targetId)) return;
+      if (client.id !== shot.shooterId && client.id !== targetId) return;
+      if (!room.hitPairs) room.hitPairs = new Set();
+      const pair = `${shotId}:${targetId}`;
+      if (room.hitPairs.has(pair)) return;
+      room.hitPairs.add(pair);
+      if (room.hitPairs.size > 12000) room.hitPairs.clear();
+      const target = room.players.get(targetId);
+      if (!target) return;
+      room.recentDamage = room.recentDamage || new Map();
+      room.recentDamage.set(targetId, { attackerId: shot.shooterId, at: Date.now() });
+      broadcastRoom(room, { type: "damage", targetId, attackerId: shot.shooterId, damage: shot.damage, shotId });
+      break;
+    }
+
+    case "kill": {
+      const room = rooms.get(client.roomId);
+      if (!room || !room.started) return;
+      const victimId = String(message.victimId || "");
+      if (victimId !== client.id || !room.players.has(victimId)) return;
+      if (room.deadPlayers?.has(victimId)) return;
+      if (!room.deadPlayers) room.deadPlayers = new Set();
+      room.deadPlayers.add(victimId);
+      const recent = room.recentDamage?.get(victimId);
+      const killerId = recent && Date.now() - recent.at < 15000 && recent.attackerId !== victimId ? recent.attackerId : null;
+      broadcastRoom(room, { type: "playerDead", id: victimId });
+      if (killerId && room.players.has(killerId)) {
+        send(room.players.get(killerId).ws, { type: "killAward", killerId, victimId, xp: 250 });
+      }
+      break;
+    }
+
+    case "respawn": {
+      const room = rooms.get(client.roomId);
+      if (!room || !room.started || !message.player) return;
+      if (room.deadPlayers) room.deadPlayers.delete(client.id);
+      room.recentDamage?.delete(client.id);
+      const p = message.player;
+      const playerState = { x: Number(p.x) || 170, y: Number(p.y) || 170, angle: Number(p.angle) || 0, turret: Number(p.turret) || 0, hp: Number(p.hp) || 100, maxHp: Number(p.maxHp) || 100, armor: Number(p.armor) || 0, name: client.name, color: typeof p.color === "string" ? p.color.slice(0,24) : "#829f60" };
+      client.player = playerState;
+      const rp = room.players.get(client.id); if (rp) rp.player = playerState;
+      broadcastRoom(room, { type: "respawn", id: client.id, player: playerState });
+      break;
+    }
+
+    case "playerDead": {
+      // Compatibility: trust only the player's own death notification.
+      const room = rooms.get(client.roomId);
+      if (!room || !room.started) return;
+      if (!room.deadPlayers) room.deadPlayers = new Set();
+      if (room.deadPlayers.has(client.id)) return;
+      room.deadPlayers.add(client.id);
+      broadcastRoom(room, { type: "playerDead", id: client.id }, client.id);
       break;
     }
 
     case "coinCollect": {
       const room = rooms.get(client.roomId);
       const coinId = Number(message.coinId);
+      const cycle = Math.max(0, Math.min(100000, Number(message.cycle) || 0));
       if (!room || !room.started || !Number.isInteger(coinId) || coinId < 0 || coinId > 10000) return;
       if (!room.claimedCoins) room.claimedCoins = new Set();
-      if (room.claimedCoins.has(coinId)) return;
-      room.claimedCoins.add(coinId);
-      broadcastRoom(room, { type: "coinCollect", coinId, collectorId: client.id });
+      const claimKey = `${coinId}:${cycle}`;
+      if (room.claimedCoins.has(claimKey)) return;
+      room.claimedCoins.add(claimKey);
+      broadcastRoom(room, { type: "coinCollect", coinId, cycle, x: Number(message.x) || 0, y: Number(message.y) || 0, collectorId: client.id });
       break;
     }
 
@@ -722,7 +798,7 @@ function handleMessage(client, message) {
       const key = `${kind}:${pickupId}`;
       if (room.claimedPickups.has(key)) return;
       room.claimedPickups.add(key);
-      broadcastRoom(room, { type: "pickupCollect", kind, pickupId, collectorId: client.id });
+      broadcastRoom(room, { type: "pickupCollect", kind, pickupId, x: Number(message.x) || 0, y: Number(message.y) || 0, collectorId: client.id });
       break;
     }
 
