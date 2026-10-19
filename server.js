@@ -496,6 +496,33 @@ function handleMessage(client, message) {
       sendFriendLists(client);
       break;
     }
+    case "friendBackupSync": {
+      // Recover accepted friendships and incoming requests from each account's local backup
+      // if the hosting filesystem was reset during a redeploy/restart.
+      if (!client.gameId) return;
+      const selfId = String(client.gameId);
+      let changed = false;
+      const friendIds = Array.isArray(message.friends) ? message.friends.slice(0, 500) : [];
+      for (const rawId of friendIds) {
+        const friendId = String(rawId || "");
+        if (!/^\d{9}$/.test(friendId) || friendId === selfId) continue;
+        if (!getSet(friendships, selfId).has(friendId)) { getSet(friendships, selfId).add(friendId); changed = true; }
+        if (!getSet(friendships, friendId).has(selfId)) { getSet(friendships, friendId).add(selfId); changed = true; }
+        getSet(friendRequests, selfId).delete(friendId);
+        getSet(friendRequests, friendId).delete(selfId);
+      }
+      const requestIds = Array.isArray(message.requests) ? message.requests.slice(0, 500) : [];
+      for (const rawId of requestIds) {
+        const requesterId = String(rawId || "");
+        if (!/^\d{9}$/.test(requesterId) || requesterId === selfId || areFriends(selfId, requesterId)) continue;
+        const requests = getSet(friendRequests, selfId);
+        if (!requests.has(requesterId)) { requests.add(requesterId); changed = true; }
+      }
+      if (changed) persistSocial();
+      sendFriendLists(client);
+      for (const friendId of getSet(friendships, selfId)) pushFriendLists(friendId);
+      break;
+    }
     case "friendSearch": {
       const gameId = String(message.gameId || "");
       if (!/^\d{9}$/.test(gameId)) {
