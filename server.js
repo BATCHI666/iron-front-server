@@ -68,8 +68,8 @@ function getLeaderboard() {
   if (!leaderboardCache || now - leaderboardCacheAt >= LEADERBOARD_REFRESH_MS) {
     const profiles = [...socialProfiles.values()].filter(p => p && /^\d{9}$/.test(String(p.gameId)));
     leaderboardCache = {
-      topKills: [...profiles].sort((a, b) => (Number(b.kills) || 0) - (Number(a.kills) || 0) || String(a.name).localeCompare(String(b.name), 'ru')).slice(0, 50),
-      topTime: [...profiles].sort((a, b) => (Number(b.playTimeSeconds) || 0) - (Number(a.playTimeSeconds) || 0) || String(a.name).localeCompare(String(b.name), 'ru')).slice(0, 50)
+      topKills: [...profiles].sort((a, b) => (Number(b.kills) || 0) - (Number(a.kills) || 0) || String(a.name).localeCompare(String(b.name), 'ru')).slice(0, 20),
+      topTime: [...profiles].sort((a, b) => (Number(b.playTimeSeconds) || 0) - (Number(a.playTimeSeconds) || 0) || String(a.name).localeCompare(String(b.name), 'ru')).slice(0, 20)
     };
     leaderboardCacheAt = now;
   }
@@ -381,6 +381,7 @@ function handleMessage(client, message) {
         if (typeof message.name === "string" && message.name.trim()) profile.name = message.name.trim().slice(0, 16);
         client.name = profile.name;
         socialProfiles.set(client.gameId, profile);
+        leaderboardCache = null;
         persistSocial();
       }
 
@@ -416,6 +417,7 @@ function handleMessage(client, message) {
       const profile = cleanProfile(message.profile, client.gameId, message.name || client.name);
       client.name = profile.name;
       socialProfiles.set(client.gameId, profile);
+      leaderboardCache = null;
       persistSocial();
       sendFriendLists(client);
       break;
