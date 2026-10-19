@@ -43,19 +43,6 @@ function persistSocial() {
   } catch (error) { console.error("Не удалось сохранить данные друзей:", error.message); }
 }
 loadSocialData();
-const LEADERBOARD_REFRESH_MS = 30 * 60 * 1000;
-let leaderboardCache = { topKills: [], topTime: [], updatedAt: 0 };
-function refreshLeaderboardCache(force = false) {
-  if (!force && leaderboardCache.updatedAt && Date.now() - leaderboardCache.updatedAt < LEADERBOARD_REFRESH_MS) return;
-  const all = [...socialProfiles.values()].filter(p => /^\d{9}$/.test(String(p.gameId)));
-  const safe = p => ({ gameId: String(p.gameId), name: String(p.name || "Игрок").slice(0, 16), kills: Math.max(0, Number(p.kills) || 0), playTimeSeconds: Math.max(0, Number(p.playTimeSeconds) || 0) });
-  leaderboardCache = {
-    topKills: all.map(safe).sort((a,b) => b.kills-a.kills || a.name.localeCompare(b.name)).slice(0,50),
-    topTime: all.map(safe).sort((a,b) => b.playTimeSeconds-a.playTimeSeconds || a.name.localeCompare(b.name)).slice(0,50),
-    updatedAt: Date.now()
-  };
-}
-setInterval(() => refreshLeaderboardCache(true), LEADERBOARD_REFRESH_MS).unref?.();
 function getSet(map, key) { if (!map.has(key)) map.set(key, new Set()); return map.get(key); }
 function cleanProfile(raw, gameId, fallbackName = "Игрок") {
   raw = raw && typeof raw === "object" ? raw : {};
@@ -73,6 +60,21 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
   };
 }
 function profileFor(gameId) { return socialProfiles.get(String(gameId)) || null; }
+let leaderboardCache = null;
+let leaderboardCacheAt = 0;
+const LEADERBOARD_REFRESH_MS = 30 * 60 * 1000;
+function getLeaderboard() {
+  const now = Date.now();
+  if (!leaderboardCache || now - leaderboardCacheAt >= LEADERBOARD_REFRESH_MS) {
+    const profiles = [...socialProfiles.values()].filter(p => p && /^\d{9}$/.test(String(p.gameId)));
+    leaderboardCache = {
+      topKills: [...profiles].sort((a, b) => (Number(b.kills) || 0) - (Number(a.kills) || 0) || String(a.name).localeCompare(String(b.name), 'ru')).slice(0, 50),
+      topTime: [...profiles].sort((a, b) => (Number(b.playTimeSeconds) || 0) - (Number(a.playTimeSeconds) || 0) || String(a.name).localeCompare(String(b.name), 'ru')).slice(0, 50)
+    };
+    leaderboardCacheAt = now;
+  }
+  return { type: 'leaderboard', topKills: leaderboardCache.topKills, topTime: leaderboardCache.topTime, updatedAt: new Date(leaderboardCacheAt).toISOString() };
+}
 function dmKey(a, b) { return [String(a), String(b)].sort().join(":"); }
 function areFriends(a, b) { return getSet(friendships, String(a)).has(String(b)); }
 function profileWithPresence(gameId) {
@@ -412,12 +414,10 @@ function handleMessage(client, message) {
       socialProfiles.set(client.gameId, profile);
       persistSocial();
       sendFriendLists(client);
-      // New profile statistics invalidate cache only when the 30-minute refresh window expires.
       break;
     }
     case "getLeaderboard": {
-      refreshLeaderboardCache(false);
-      send(client.ws, { type: "leaderboard", ...leaderboardCache, selfGameId: client.gameId || null });
+      send(client.ws, getLeaderboard());
       break;
     }
     case "presenceUpdate": {
