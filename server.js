@@ -295,7 +295,19 @@ function handleMessage(c,m) {
       member.player=state;c.player=state;broadcastRoom(room,{type:"respawn",id:c.id,player:state});break;
     }
     case "coinCollect": {
-      const room=rooms.get(c.roomId),id=Number(m.coinId);if(!room||!room.started||!Number.isInteger(id)||id<0||id>10000)return;if(!room.claimedCoins)room.claimedCoins=new Set();if(room.claimedCoins.has(id))return;room.claimedCoins.add(id);broadcastRoom(room,{type:"coinCollect",coinId:id,collectorId:c.id});break;
+      const room=rooms.get(c.roomId),id=Number(m.coinId),cycle=Number(m.cycle);
+      if(!room||!room.started||!Number.isInteger(id)||id<0||id>10000||!Number.isInteger(cycle)||cycle<1||cycle>1000000)return;
+      // Монета может появляться повторно. Блокируем повторный подбор только
+      // в рамках одного цикла, а не навсегда по одному coinId.
+      if(!room.claimedCoins)room.claimedCoins=new Set();
+      const key=`${id}:${cycle}`;
+      if(room.claimedCoins.has(key))return;
+      room.claimedCoins.add(key);
+      if(room.claimedCoins.size>10000){
+        const keep=[...room.claimedCoins].slice(-5000);
+        room.claimedCoins=new Set(keep);
+      }
+      broadcastRoom(room,{type:"coinCollect",coinId:id,cycle,collectorId:c.id});break;
     }
     case "pickupCollect": {
       const room=rooms.get(c.roomId),kind=String(m.kind||""),id=Number(m.pickupId);if(!room||!room.started||!["armor","medkit"].includes(kind)||!Number.isInteger(id)||id<1||id>10000)return;if(!room.claimedPickups)room.claimedPickups=new Set();const key=`${kind}:${id}`;if(room.claimedPickups.has(key))return;room.claimedPickups.add(key);broadcastRoom(room,{type:"pickupCollect",kind,pickupId:id,collectorId:c.id});break;
