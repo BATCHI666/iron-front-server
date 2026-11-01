@@ -44,6 +44,10 @@ function persistSocial() {
 }
 loadSocialData();
 function getSet(map, key) { if (!map.has(key)) map.set(key, new Set()); return map.get(key); }
+const ALLOWED_TANK_MODELS = new Set(["standard","standard2","t34","t44","t62","is3","sherman","pershing","m48patton","m48german","panther","leopard1","t29","maus","challenger1","centurion","amx30","charb1","type61","type90","type59","ztz99","strv103","cv90120","churchill","amx13","dracula"]);
+function safeTankModel(value) { const model=String(value||"standard"); return ALLOWED_TANK_MODELS.has(model)?model:"standard"; }
+function safeTankColor(value, fallback="#829f60") { const color=String(value||""); return /^#[0-9a-f]{6}$/i.test(color)?color:fallback; }
+function clientColorFallback(member) { return member?.ws?.clientTankColor || "#829f60"; }
 function cleanProfile(raw, gameId, fallbackName = "Игрок") {
   raw = raw && typeof raw === "object" ? raw : {};
   return {
@@ -54,27 +58,12 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
     kills: Math.max(0, Math.min(1e9, Number(raw.kills) || 0)),
     deaths: Math.max(0, Math.min(1e9, Number(raw.deaths) || 0)),
     matches: Math.max(0, Math.min(1e9, Number(raw.matches) || 0)),
-    playTimeSeconds: Math.max(0, Math.min(1e12, Number(raw.playTimeSeconds) || 0)),
     created: String(raw.created || new Date().toISOString()).slice(0, 40),
-    tankColor: /^#[0-9a-f]{6}$/i.test(String(raw.tankColor || "")) ? String(raw.tankColor) : "#e51f2a"
+    tankColor: safeTankColor(raw.tankColor, "#e51f2a"),
+    tankModel: safeTankModel(raw.tankModel)
   };
 }
 function profileFor(gameId) { return socialProfiles.get(String(gameId)) || null; }
-let leaderboardCache = null;
-let leaderboardCacheAt = 0;
-const LEADERBOARD_REFRESH_MS = 30 * 60 * 1000;
-function getLeaderboard() {
-  const now = Date.now();
-  if (!leaderboardCache || now - leaderboardCacheAt >= LEADERBOARD_REFRESH_MS) {
-    const profiles = [...socialProfiles.values()].filter(p => p && /^\d{9}$/.test(String(p.gameId)));
-    leaderboardCache = {
-      topKills: [...profiles].sort((a, b) => (Number(b.kills) || 0) - (Number(a.kills) || 0) || String(a.name).localeCompare(String(b.name), 'ru')).slice(0, 20),
-      topTime: [...profiles].sort((a, b) => (Number(b.playTimeSeconds) || 0) - (Number(a.playTimeSeconds) || 0) || String(a.name).localeCompare(String(b.name), 'ru')).slice(0, 20)
-    };
-    leaderboardCacheAt = now;
-  }
-  return { type: 'leaderboard', topKills: leaderboardCache.topKills, topTime: leaderboardCache.topTime, updatedAt: new Date(leaderboardCacheAt).toISOString() };
-}
 function dmKey(a, b) { return [String(a), String(b)].sort().join(":"); }
 function areFriends(a, b) { return getSet(friendships, String(a)).has(String(b)); }
 function profileWithPresence(gameId) {
@@ -136,40 +125,32 @@ function roomInfo(room) {
     turret: Number.isFinite(p.player?.turret) ? p.player.turret : 0,
     hp: Number.isFinite(p.player?.hp) ? p.player.hp : 100,
     maxHp: Number.isFinite(p.player?.maxHp) ? p.player.maxHp : 100,
-    armor: Number.isFinite(p.player?.armor) ? p.player.armor : 0
+    armor: Number.isFinite(p.player?.armor) ? p.player.armor : 0,
+    model: safeTankModel(p.player?.model || p.model || "standard")
   }));
 
   return {
     id: room.id,
     name: room.name,
-
-    // Поля, которые ожидает HTML-клиент
     ownerId: room.hostId,
     hostId: room.hostId,
     players: room.players.size,
     playerNames: members.map(p => p.name),
     hasPassword: Boolean(room.password),
-
     maxPlayers: room.maxPlayers,
     started: room.started,
-
-    // Полный список нужен для запуска боя
     members
   };
 }
 
 function sendRooms(ws) {
-  // Показываем и уже начавшиеся комнаты: в них можно подключиться к текущему бою.
-  const list = [...rooms.values()]
-    .map(roomInfo);
-
+  const list = [...rooms.values()].map(roomInfo);
   send(ws, { type: "rooms", rooms: list });
 }
 
 function updateRoom(room) {
   if (rooms.has(room.id)) {
     const info = roomInfo(room);
-
     broadcastRoom(room, {
       type: "roomUpdate",
       room: info,
@@ -180,7 +161,7 @@ function updateRoom(room) {
   for (const client of clients.values()) {
     if (!client.roomId) sendRooms(client.ws);
   }
-  // Keep friends' online/activity/room indicators in sync when a room changes.
+
   for (const player of room.players.values()) {
     const memberClient = clients.get(player.id);
     if (memberClient?.gameId) refreshFriendsOf(memberClient.gameId);
@@ -232,7 +213,6 @@ function joinRoom(client, requestedId, password = "") {
     return;
   }
 
-  // В начавшийся бой тоже можно подключаться, если есть свободные места.
   if (room.password && String(password) !== room.password) {
     sendError(client, "Неверный пароль комнаты.");
     return;
@@ -261,7 +241,8 @@ function joinRoom(client, requestedId, password = "") {
     id: client.id,
     ws: client.ws,
     name: client.name,
-    player: null
+    model: safeTankModel(client.tankModel),
+    player: { model: safeTankModel(client.tankModel), color: safeTankColor(client.tankColor) }
   });
 
   const info = roomInfo(room);
@@ -289,7 +270,8 @@ function joinRoom(client, requestedId, password = "") {
     const players = [...room.players.values()].map((p, index) => ({
       id: p.id,
       name: p.name,
-      color: p.player?.color || "#829f60",
+      color: safeTankColor(p.player?.color || "#829f60"),
+      model: safeTankModel(p.player?.model || p.model || "standard"),
       x: Number.isFinite(p.player?.x) ? p.player.x : 170 + (index % 4) * 85,
       y: Number.isFinite(p.player?.y) ? p.player.y : 170 + Math.floor(index / 4) * 85,
       angle: Number.isFinite(p.player?.angle) ? p.player.angle : 0,
@@ -328,19 +310,14 @@ function startGame(client) {
   room.claimedCoins = new Set();
   room.claimedPickups = new Set();
   room.chatMessageIds = new Set();
-  room.shots = new Map();
-  room.hitPairs = new Set();
-  room.recentDamage = new Map();
-  room.deadPlayers = new Set();
 
   const members = [...room.players.values()];
 
   const players = members.map((p, index) => ({
     id: p.id,
     name: p.name,
-    color: p.player?.color || "#829f60",
-
-    // Разводим танки по разным точкам старта
+    color: safeTankColor(p.player?.color || clientColorFallback(p), "#829f60"),
+    model: safeTankModel(p.player?.model || p.model || "standard"),
     x: 170 + (index % 4) * 85,
     y: 170 + Math.floor(index / 4) * 85,
     angle: 0,
@@ -355,7 +332,6 @@ function startGame(client) {
     players
   };
 
-  // Отправляем событие всем участникам, включая создателя
   broadcastRoom(room, message);
   updateRoom(room);
   for (const p of room.players.values()) if (p.ws && p.ws.readyState === WebSocket.OPEN) { const c = clients.get(p.id); if (c?.gameId) refreshFriendsOf(c.gameId); }
@@ -380,8 +356,9 @@ function handleMessage(client, message) {
         const profile = cleanProfile(message.profile, client.gameId, client.name);
         if (typeof message.name === "string" && message.name.trim()) profile.name = message.name.trim().slice(0, 16);
         client.name = profile.name;
+        client.tankModel = safeTankModel(message.profile?.tankModel || profile.tankModel);
+        client.tankColor = safeTankColor(message.profile?.tankColor || profile.tankColor, "#829f60");
         socialProfiles.set(client.gameId, profile);
-        leaderboardCache = null;
         persistSocial();
       }
 
@@ -391,6 +368,7 @@ function handleMessage(client, message) {
         name: client.name,
         gameId: client.gameId || null
       });
+
       if (client.gameId) {
         const unread = [];
         for (const list of directMessages.values()) for (const item of list) {
@@ -400,14 +378,16 @@ function handleMessage(client, message) {
         unread.sort((a,b)=>Date.parse(a.createdAt)-Date.parse(b.createdAt));
         if (unread.length) send(client.ws, { type: "friendDmNotifications", messages: unread.slice(-50) });
       }
+
       sendFriendLists(client);
       refreshFriendsOf(client.gameId);
-      // Deliver pending friend requests when an account reconnects.
+
       if (client.gameId) {
         for (const requesterId of getSet(friendRequests, client.gameId)) {
           send(client.ws, { type: "friendRequestReceived", from: requesterId, profile: profileFor(requesterId) });
         }
       }
+
       sendRooms(client.ws);
       break;
     }
@@ -416,155 +396,220 @@ function handleMessage(client, message) {
       if (!client.gameId) return;
       const profile = cleanProfile(message.profile, client.gameId, message.name || client.name);
       client.name = profile.name;
+      client.tankModel = safeTankModel(message.profile?.tankModel || profile.tankModel);
+      client.tankColor = safeTankColor(message.profile?.tankColor || profile.tankColor, client.tankColor || "#829f60");
+
+      if (client.roomId) {
+        const activeRoom = rooms.get(client.roomId);
+        const member = activeRoom?.players.get(client.id);
+        if (member) {
+          member.model = client.tankModel;
+          member.player = {
+            ...(member.player || {}),
+            model: client.tankModel,
+            color: client.tankColor
+          };
+        }
+        if (activeRoom) updateRoom(activeRoom);
+      }
+
       socialProfiles.set(client.gameId, profile);
-      leaderboardCache = null;
       persistSocial();
       sendFriendLists(client);
       break;
     }
-    case "getLeaderboard": {
-      send(client.ws, getLeaderboard());
-      break;
-    }
+
     case "presenceUpdate": {
       const allowed = new Set(["В меню", "Одиночная игра", "Мультиплеер"]);
       if (allowed.has(String(message.activity || ""))) client.activity = String(message.activity);
       if (client.gameId) refreshFriendsOf(client.gameId);
       break;
     }
+
     case "friendConversation": {
       const otherId = String(message.withGameId || "");
       if (!client.gameId || !/^\d{9}$/.test(otherId) || !areFriends(client.gameId, otherId)) {
-        send(client.ws, { type: "friendError", message: "Личный чат доступен только друзьям." }); return;
+        send(client.ws, { type: "friendError", message: "Личный чат доступен только друзьям." });
+        return;
       }
+
       dmReadAt.set(`${client.gameId}:${otherId}`, Date.now());
       persistSocial();
-      send(client.ws, { type: "friendConversation", withGameId: otherId, requestId: String(message.requestId || "").slice(0, 80), messages: directMessages.get(dmKey(client.gameId, otherId)) || [] });
+      send(client.ws, {
+        type: "friendConversation",
+        withGameId: otherId,
+        requestId: String(message.requestId || "").slice(0, 80),
+        messages: directMessages.get(dmKey(client.gameId, otherId)) || []
+      });
       break;
     }
+
     case "friendMarkRead": {
       const otherId = String(message.withGameId || "");
       if (!client.gameId || !/^\d{9}$/.test(otherId) || !areFriends(client.gameId, otherId)) return;
+
       dmReadAt.set(`${client.gameId}:${otherId}`, Date.now());
       persistSocial();
       send(client.ws, { type: "friendReadMarked", withGameId: otherId });
       break;
     }
+
     case "friendMessage": {
       const toId = String(message.toGameId || "");
       const body = String(message.message || "").trim().slice(0, 500);
+
       if (!client.gameId || !/^\d{9}$/.test(toId) || !areFriends(client.gameId, toId) || !body) {
-        send(client.ws, { type: "friendError", message: "Сообщения можно отправлять только друзьям." }); return;
+        send(client.ws, { type: "friendError", message: "Сообщения можно отправлять только друзьям." });
+        return;
       }
-      const entry = { messageId: randomUUID(), fromGameId: client.gameId, toGameId: toId, fromName: client.name, message: body, createdAt: new Date().toISOString() };
+
+      const entry = {
+        messageId: randomUUID(),
+        fromGameId: client.gameId,
+        toGameId: toId,
+        fromName: client.name,
+        message: body,
+        createdAt: new Date().toISOString()
+      };
+
       const key = dmKey(client.gameId, toId);
       const history = directMessages.get(key) || [];
       history.push(entry);
       directMessages.set(key, history.slice(-300));
       persistSocial();
-      send(client.ws, { type: "friendMessageSent", ...entry, toGameId: toId, requestId: String(message.requestId || "").slice(0, 80) });
+
+      send(client.ws, {
+        type: "friendMessageSent",
+        ...entry,
+        toGameId: toId,
+        requestId: String(message.requestId || "").slice(0, 80)
+      });
+
       const target = idToClient.get(toId);
-      if (target && target.ws.readyState === WebSocket.OPEN) send(target.ws, { type: "friendMessageReceived", ...entry });
+      if (target && target.ws.readyState === WebSocket.OPEN) {
+        send(target.ws, { type: "friendMessageReceived", ...entry });
+      }
       break;
     }
+
     case "friendJoin": {
       const targetId = String(message.gameId || "");
+
       if (!client.gameId || !getSet(friendships, client.gameId).has(targetId)) {
-        send(client.ws, { type: "friendJoinResult", ok: false, message: "Зайти можно только к игроку из списка друзей." });
+        send(client.ws, {
+          type: "friendJoinResult",
+          ok: false,
+          message: "Зайти можно только к игроку из списка друзей."
+        });
         return;
       }
+
       const target = idToClient.get(targetId);
       if (!target || target.ws.readyState !== WebSocket.OPEN) {
         send(client.ws, { type: "friendJoinResult", ok: false, message: "Друг сейчас не в сети." });
         return;
       }
+
       const targetRoom = target.roomId ? rooms.get(target.roomId) : null;
       if (!targetRoom) {
-        send(client.ws, { type: "friendJoinResult", ok: false, message: "Друг сейчас не в сетевой комнате. Он может играть в одиночном режиме или находиться в меню." });
+        send(client.ws, {
+          type: "friendJoinResult",
+          ok: false,
+          message: "Друг сейчас не в сетевой комнате. Он может играть в одиночном режиме или находиться в меню."
+        });
         return;
       }
+
       if (targetRoom.players.size >= targetRoom.maxPlayers && !targetRoom.players.has(client.id)) {
         send(client.ws, { type: "friendJoinResult", ok: false, message: "Комната друга заполнена." });
         return;
       }
-      send(client.ws, { type: "friendRoomFound", roomId: targetRoom.id, roomName: targetRoom.name, hasPassword: Boolean(targetRoom.password), started: Boolean(targetRoom.started) });
+
+      send(client.ws, {
+        type: "friendRoomFound",
+        roomId: targetRoom.id,
+        roomName: targetRoom.name,
+        hasPassword: Boolean(targetRoom.password),
+        started: Boolean(targetRoom.started)
+      });
       break;
     }
-    case "friendsList": {
-      sendFriendLists(client);
-      break;
-    }
+
+    case "friendsList":
     case "friendRequests": {
       sendFriendLists(client);
       break;
     }
-    case "friendBackupSync": {
-      // Recover accepted friendships and incoming requests from each account's local backup
-      // if the hosting filesystem was reset during a redeploy/restart.
-      if (!client.gameId) return;
-      const selfId = String(client.gameId);
-      let changed = false;
-      const friendIds = Array.isArray(message.friends) ? message.friends.slice(0, 500) : [];
-      for (const rawId of friendIds) {
-        const friendId = String(rawId || "");
-        if (!/^\d{9}$/.test(friendId) || friendId === selfId) continue;
-        if (!getSet(friendships, selfId).has(friendId)) { getSet(friendships, selfId).add(friendId); changed = true; }
-        if (!getSet(friendships, friendId).has(selfId)) { getSet(friendships, friendId).add(selfId); changed = true; }
-        getSet(friendRequests, selfId).delete(friendId);
-        getSet(friendRequests, friendId).delete(selfId);
-      }
-      const requestIds = Array.isArray(message.requests) ? message.requests.slice(0, 500) : [];
-      for (const rawId of requestIds) {
-        const requesterId = String(rawId || "");
-        if (!/^\d{9}$/.test(requesterId) || requesterId === selfId || areFriends(selfId, requesterId)) continue;
-        const requests = getSet(friendRequests, selfId);
-        if (!requests.has(requesterId)) { requests.add(requesterId); changed = true; }
-      }
-      if (changed) persistSocial();
-      sendFriendLists(client);
-      for (const friendId of getSet(friendships, selfId)) pushFriendLists(friendId);
-      break;
-    }
+
     case "friendSearch": {
       const gameId = String(message.gameId || "");
       if (!/^\d{9}$/.test(gameId)) {
         send(client.ws, { type: "friendSearchResult", id: gameId, profile: null });
         return;
       }
+
       const profile = profileFor(gameId);
-      send(client.ws, { type: "friendSearchResult", id: gameId, profile: profile && gameId !== client.gameId ? profileWithPresence(gameId) : null });
+      send(client.ws, {
+        type: "friendSearchResult",
+        id: gameId,
+        profile: profile && gameId !== client.gameId ? profileWithPresence(gameId) : null
+      });
       break;
     }
+
     case "friendRequest": {
       const targetId = String(message.gameId || "");
       if (!client.gameId || !/^\d{9}$/.test(targetId) || targetId === client.gameId) {
-        send(client.ws, { type: "friendError", message: "Нельзя отправить заявку этому игроку." }); return;
+        send(client.ws, { type: "friendError", message: "Нельзя отправить заявку этому игроку." });
+        return;
       }
-      if (!profileFor(targetId)) { send(client.ws, { type: "friendError", message: "Игрок не найден на сервере. Попроси его один раз подключиться к игре." }); return; }
-      if (getSet(friendships, client.gameId).has(targetId)) { send(client.ws, { type: "friendError", message: "Этот игрок уже у тебя в друзьях." }); return; }
+
+      if (!profileFor(targetId)) {
+        send(client.ws, { type: "friendError", message: "Игрок не найден на сервере. Попроси его один раз подключиться к игре." });
+        return;
+      }
+
+      if (getSet(friendships, client.gameId).has(targetId)) {
+        send(client.ws, { type: "friendError", message: "Этот игрок уже у тебя в друзьях." });
+        return;
+      }
+
       const requests = getSet(friendRequests, targetId);
-      if (requests.has(client.gameId)) { send(client.ws, { type: "friendError", message: "Заявка уже отправлена." }); return; }
+      if (requests.has(client.gameId)) {
+        send(client.ws, { type: "friendError", message: "Заявка уже отправлена." });
+        return;
+      }
+
       requests.add(client.gameId);
       persistSocial();
       send(client.ws, { type: "friendRequestSent", message: "Заявка в друзья отправлена." });
+
       const target = idToClient.get(targetId);
       if (target) send(target.ws, { type: "friendRequestReceived", from: client.gameId, profile: profileFor(client.gameId) });
       pushFriendLists(targetId);
       break;
     }
+
     case "friendAccept": {
       const fromId = String(message.gameId || "");
-      if (!client.gameId || !getSet(friendRequests, client.gameId).has(fromId)) { send(client.ws, { type: "friendError", message: "Заявка не найдена." }); return; }
+      if (!client.gameId || !getSet(friendRequests, client.gameId).has(fromId)) {
+        send(client.ws, { type: "friendError", message: "Заявка не найдена." });
+        return;
+      }
+
       getSet(friendRequests, client.gameId).delete(fromId);
       getSet(friendships, client.gameId).add(fromId);
       getSet(friendships, fromId).add(client.gameId);
       persistSocial();
+
       send(client.ws, { type: "friendAccepted", gameId: fromId });
       const fromClient = idToClient.get(fromId);
       if (fromClient) send(fromClient.ws, { type: "friendAccepted", gameId: client.gameId, profile: profileFor(client.gameId) });
-      pushFriendLists(client.gameId); pushFriendLists(fromId);
+      pushFriendLists(client.gameId);
+      pushFriendLists(fromId);
       break;
     }
+
     case "friendDecline": {
       const fromId = String(message.gameId || "");
       if (client.gameId) getSet(friendRequests, client.gameId).delete(fromId);
@@ -572,13 +617,15 @@ function handleMessage(client, message) {
       sendFriendLists(client);
       break;
     }
+
     case "friendRemove": {
       const friendId = String(message.gameId || "");
       if (client.gameId) getSet(friendships, client.gameId).delete(friendId);
       getSet(friendships, friendId).delete(client.gameId);
       persistSocial();
       send(client.ws, { type: "friendRemoved", gameId: friendId });
-      pushFriendLists(client.gameId); pushFriendLists(friendId);
+      pushFriendLists(client.gameId);
+      pushFriendLists(friendId);
       break;
     }
 
@@ -589,9 +636,7 @@ function handleMessage(client, message) {
     }
 
     case "createRoom": {
-      const name = String(
-        message.name || message.roomName || ""
-      ).trim().slice(0, 28);
+      const name = String(message.name || message.roomName || "").trim().slice(0, 28);
 
       if (!name) {
         sendError(client, "Введи название комнаты.");
@@ -600,11 +645,7 @@ function handleMessage(client, message) {
 
       if (client.roomId) leaveRoom(client);
 
-      const maxPlayers = Math.max(
-        2,
-        Math.min(12, Number(message.maxPlayers) || 4)
-      );
-
+      const maxPlayers = Math.max(2, Math.min(12, Number(message.maxPlayers) || 4));
       const password = String(message.password || "").slice(0, 40);
       const id = randomUUID().slice(0, 8);
 
@@ -626,23 +667,17 @@ function handleMessage(client, message) {
         id: client.id,
         ws: client.ws,
         name: client.name,
-        player: null
+        model: safeTankModel(client.tankModel),
+        player: {
+          model: safeTankModel(client.tankModel),
+          color: safeTankColor(client.tankColor)
+        }
       });
 
       const info = roomInfo(room);
 
-      send(client.ws, {
-        type: "roomCreated",
-        room: info,
-        roomId: id
-      });
-
-      send(client.ws, {
-        type: "joined",
-        room: info,
-        players: info.members,
-        id: client.id
-      });
+      send(client.ws, { type: "roomCreated", room: info, roomId: id });
+      send(client.ws, { type: "joined", room: info, players: info.members, id: client.id });
 
       updateRoom(room);
 
@@ -652,11 +687,7 @@ function handleMessage(client, message) {
     }
 
     case "joinRoom": {
-      joinRoom(
-        client,
-        message.roomId || message.id || message.room,
-        message.password || ""
-      );
+      joinRoom(client, message.roomId || message.id || message.room, message.password || "");
       break;
     }
 
@@ -676,17 +707,9 @@ function handleMessage(client, message) {
       if (!room || !room.started || !message.player) return;
 
       const p = message.player;
+      const validNumber = value => typeof value === "number" && Number.isFinite(value);
 
-      // Проверяем числа, чтобы не принимать некорректные координаты
-      const validNumber = value =>
-        typeof value === "number" && Number.isFinite(value);
-
-      if (
-        !validNumber(p.x) ||
-        !validNumber(p.y) ||
-        Math.abs(p.x) > 10000 ||
-        Math.abs(p.y) > 10000
-      ) return;
+      if (!validNumber(p.x) || !validNumber(p.y) || Math.abs(p.x) > 10000 || Math.abs(p.y) > 10000) return;
 
       const playerState = {
         x: p.x,
@@ -697,9 +720,12 @@ function handleMessage(client, message) {
         maxHp: validNumber(p.maxHp) ? Math.max(1, Math.min(1000, p.maxHp)) : 100,
         armor: validNumber(p.armor) ? Math.max(0, Math.min(100, p.armor)) : 0,
         name: client.name,
-        color: typeof p.color === "string" ? p.color.slice(0, 24) : "#829f60"
+        color: safeTankColor(p.color, client.tankColor || "#829f60"),
+        model: safeTankModel(p.model || client.tankModel || "standard")
       };
 
+      client.tankModel = playerState.model;
+      client.tankColor = playerState.color;
       client.player = playerState;
 
       const roomPlayer = room.players.get(client.id);
@@ -714,106 +740,62 @@ function handleMessage(client, message) {
       break;
     }
 
+    case "respawn": {
+      const room = rooms.get(client.roomId);
+      const p = message.player;
+      if (!room || !room.started || !p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+
+      const playerState = {
+        x: Math.max(-10000, Math.min(10000, p.x)),
+        y: Math.max(-10000, Math.min(10000, p.y)),
+        angle: Number.isFinite(p.angle) ? p.angle : 0,
+        turret: Number.isFinite(p.turret) ? p.turret : 0,
+        hp: Number.isFinite(p.hp) ? Math.max(0, Math.min(1000, p.hp)) : 100,
+        maxHp: Number.isFinite(p.maxHp) ? Math.max(1, Math.min(1000, p.maxHp)) : 100,
+        armor: Number.isFinite(p.armor) ? Math.max(0, Math.min(100, p.armor)) : 0,
+        name: client.name,
+        color: safeTankColor(p.color, client.tankColor || "#829f60"),
+        model: safeTankModel(p.model || client.tankModel || "standard")
+      };
+
+      client.player = playerState;
+      client.tankModel = playerState.model;
+      client.tankColor = playerState.color;
+
+      const member = room.players.get(client.id);
+      if (member) member.player = playerState;
+
+      broadcastRoom(room, { type: "respawn", id: client.id, player: playerState }, client.id);
+      break;
+    }
+
     case "shoot": {
       const room = rooms.get(client.roomId);
       if (!room || !room.started) return;
 
-      const numberOr = (v, fallback = 0) =>
-        typeof v === "number" && Number.isFinite(v) ? v : fallback;
+      const numberOr = (v, fallback = 0) => typeof v === "number" && Number.isFinite(v) ? v : fallback;
 
-      const shotId = String(message.shotId || `${client.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`).slice(0, 120);
-      if (!room.shots) room.shots = new Map();
-      room.shots.set(shotId, { shooterId: client.id, createdAt: Date.now(), damage: Math.max(0, Math.min(100, numberOr(message.damage, 28))) });
-      if (room.shots.size > 4000) {
-        const cutoff = Date.now() - 15000;
-        for (const [id, shot] of room.shots) if (shot.createdAt < cutoff) room.shots.delete(id);
-      }
       broadcastRoom(room, {
         type: "shoot",
         id: client.id,
         playerId: client.id,
-        shotId,
         x: numberOr(message.x),
         y: numberOr(message.y),
         vx: numberOr(message.vx),
         vy: numberOr(message.vy),
-        damage: Math.max(0, Math.min(100, numberOr(message.damage, 28)))
+        damage: Math.max(0, Math.min(100, numberOr(message.damage, 20)))
       }, client.id);
-      break;
-    }
-
-    case "hit": {
-      const room = rooms.get(client.roomId);
-      const shotId = String(message.shotId || "").slice(0, 120);
-      const targetId = String(message.targetId || "");
-      const shot = room?.shots?.get(shotId);
-      if (!room || !room.started || !shot || Date.now() - shot.createdAt > 5000) return;
-      if (shot.shooterId === targetId || !room.players.has(targetId)) return;
-      if (client.id !== shot.shooterId && client.id !== targetId) return;
-      if (!room.hitPairs) room.hitPairs = new Set();
-      const pair = `${shotId}:${targetId}`;
-      if (room.hitPairs.has(pair)) return;
-      room.hitPairs.add(pair);
-      if (room.hitPairs.size > 12000) room.hitPairs.clear();
-      const target = room.players.get(targetId);
-      if (!target) return;
-      room.recentDamage = room.recentDamage || new Map();
-      room.recentDamage.set(targetId, { attackerId: shot.shooterId, at: Date.now() });
-      broadcastRoom(room, { type: "damage", targetId, attackerId: shot.shooterId, damage: shot.damage, shotId });
-      break;
-    }
-
-    case "kill": {
-      const room = rooms.get(client.roomId);
-      if (!room || !room.started) return;
-      const victimId = String(message.victimId || "");
-      if (victimId !== client.id || !room.players.has(victimId)) return;
-      if (room.deadPlayers?.has(victimId)) return;
-      if (!room.deadPlayers) room.deadPlayers = new Set();
-      room.deadPlayers.add(victimId);
-      const recent = room.recentDamage?.get(victimId);
-      const killerId = recent && Date.now() - recent.at < 15000 && recent.attackerId !== victimId ? recent.attackerId : null;
-      broadcastRoom(room, { type: "playerDead", id: victimId });
-      if (killerId && room.players.has(killerId)) {
-        send(room.players.get(killerId).ws, { type: "killAward", killerId, victimId, xp: 250 });
-      }
-      break;
-    }
-
-    case "respawn": {
-      const room = rooms.get(client.roomId);
-      if (!room || !room.started || !message.player) return;
-      if (room.deadPlayers) room.deadPlayers.delete(client.id);
-      room.recentDamage?.delete(client.id);
-      const p = message.player;
-      const playerState = { x: Number(p.x) || 170, y: Number(p.y) || 170, angle: Number(p.angle) || 0, turret: Number(p.turret) || 0, hp: Number(p.hp) || 100, maxHp: Number(p.maxHp) || 100, armor: Number(p.armor) || 0, name: client.name, color: typeof p.color === "string" ? p.color.slice(0,24) : "#829f60" };
-      client.player = playerState;
-      const rp = room.players.get(client.id); if (rp) rp.player = playerState;
-      broadcastRoom(room, { type: "respawn", id: client.id, player: playerState });
-      break;
-    }
-
-    case "playerDead": {
-      // Compatibility: trust only the player's own death notification.
-      const room = rooms.get(client.roomId);
-      if (!room || !room.started) return;
-      if (!room.deadPlayers) room.deadPlayers = new Set();
-      if (room.deadPlayers.has(client.id)) return;
-      room.deadPlayers.add(client.id);
-      broadcastRoom(room, { type: "playerDead", id: client.id }, client.id);
       break;
     }
 
     case "coinCollect": {
       const room = rooms.get(client.roomId);
       const coinId = Number(message.coinId);
-      const cycle = Math.max(0, Math.min(100000, Number(message.cycle) || 0));
       if (!room || !room.started || !Number.isInteger(coinId) || coinId < 0 || coinId > 10000) return;
       if (!room.claimedCoins) room.claimedCoins = new Set();
-      const claimKey = `${coinId}:${cycle}`;
-      if (room.claimedCoins.has(claimKey)) return;
-      room.claimedCoins.add(claimKey);
-      broadcastRoom(room, { type: "coinCollect", coinId, cycle, x: Number(message.x) || 0, y: Number(message.y) || 0, collectorId: client.id });
+      if (room.claimedCoins.has(coinId)) return;
+      room.claimedCoins.add(coinId);
+      broadcastRoom(room, { type: "coinCollect", coinId, collectorId: client.id });
       break;
     }
 
@@ -827,17 +809,16 @@ function handleMessage(client, message) {
       const key = `${kind}:${pickupId}`;
       if (room.claimedPickups.has(key)) return;
       room.claimedPickups.add(key);
-      broadcastRoom(room, { type: "pickupCollect", kind, pickupId, x: Number(message.x) || 0, y: Number(message.y) || 0, collectorId: client.id });
+      broadcastRoom(room, { type: "pickupCollect", kind, pickupId, collectorId: client.id });
       break;
     }
 
     case "chat": {
       const room = rooms.get(client.roomId);
-      const text = String(message.message || message.text || "")
-        .trim()
-        .slice(0, 180);
+      const text = String(message.message || message.text || "").trim().slice(0, 180);
 
       if (!room || !text) return;
+
       const clientMsgId = typeof message.clientMsgId === "string" ? message.clientMsgId.slice(0, 80) : "";
       if (clientMsgId) {
         if (!room.chatMessageIds) room.chatMessageIds = new Set();
@@ -875,13 +856,10 @@ wss.on("connection", ws => {
   };
 
   clients.set(id, client);
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
 
-  send(ws, {
-    type: "welcome",
-    id,
-    name: client.name
-  });
-
+  send(ws, { type: "welcome", id, name: client.name });
   sendRooms(ws);
 
   ws.on("message", raw => {
@@ -896,13 +874,30 @@ wss.on("connection", ws => {
   ws.on("close", () => {
     leaveRoom(client);
     clients.delete(id);
-    if (client.gameId && idToClient.get(client.gameId) === client) { idToClient.delete(client.gameId); refreshFriendsOf(client.gameId); }
+    if (client.gameId && idToClient.get(client.gameId) === client) {
+      idToClient.delete(client.gameId);
+      refreshFriendsOf(client.gameId);
+    }
   });
 
   ws.on("error", error => {
     console.error("Ошибка WebSocket:", error.message);
   });
 });
+
+// Ping/pong heartbeat clears stale mobile/background connections from rooms.
+const heartbeatTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { try { ws.terminate(); } catch {} }
+  }
+}, 15000);
+
+heartbeatTimer.unref?.();
 
 wss.on("listening", () => {
   console.log("==================================");
@@ -914,5 +909,19 @@ wss.on("listening", () => {
 wss.on("error", error => {
   console.error("Ошибка сервера:", error.message);
 });
-process.on("SIGTERM", () => { try { persistSocial(); } finally { wss.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1500).unref(); } });
-process.on("SIGINT", () => { try { persistSocial(); } finally { wss.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1500).unref(); } });
+
+process.on("SIGTERM", () => {
+  try { persistSocial(); }
+  finally {
+    wss.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1500).unref();
+  }
+});
+
+process.on("SIGINT", () => {
+  try { persistSocial(); }
+  finally {
+    wss.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1500).unref();
+  }
+});    
