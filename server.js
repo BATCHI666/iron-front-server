@@ -25,7 +25,7 @@ const ALLOWED_TANK_MODELS = new Set([
   "panther","leopard1","t29","maus","challenger1",
   "centurion","amx30","charb1","type61","type90",
   "type59","ztz99","strv103","cv90120","churchill",
-  "amx13","dracula"
+  "amx13","dracula","ruby","xonex"
 ]);
 
 function safeTankModel(v) {
