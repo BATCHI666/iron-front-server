@@ -214,6 +214,28 @@ function handleMessage(c,m) {
   switch(m.type){
     case "hello": case "setName": {
       if(typeof m.name==="string"&&m.name.trim())c.name=m.name.trim().slice(0,16);
+      // Sync every locally registered account, not only the currently selected/online one.
+      // The browser stores multiple accounts locally; the server keeps a persistent directory.
+      let syncedAccounts=0;
+      for(const rawAccount of (Array.isArray(m.accounts)?m.accounts:[]).slice(0,3)){
+        const accountId=String(rawAccount?.gameId||"");
+        if(!/^\d{9}$/.test(accountId))continue;
+        const previous=profileFor(accountId);
+        const snapshot=cleanProfile(rawAccount,accountId,rawAccount?.name||"Игрок");
+        if(previous){
+          snapshot.created=previous.created||snapshot.created;
+          snapshot.registration=previous.registration||snapshot.registration;
+          snapshot.playTimeSeconds=Math.max(Number(previous.playTimeSeconds)||0,Number(snapshot.playTimeSeconds)||0);
+          snapshot.totalCoinsEarned=Math.max(Number(previous.totalCoinsEarned)||0,Number(snapshot.totalCoinsEarned)||0);
+          snapshot.claimedMedals=[...new Set([...(previous.claimedMedals||[]),...(snapshot.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
+          if(!snapshot.selectedMedal||!snapshot.claimedMedals.includes(snapshot.selectedMedal))snapshot.selectedMedal=previous.selectedMedal||"";
+        } else {
+          const geo=requestCountry({headers:c.requestHeaders||{}});
+          const device=parseDevice(c.userAgent||"");
+          snapshot.registration={firstSeenAt:new Date().toISOString(),country:geo.country,region:geo.region,device:device.device,os:device.os,browser:device.browser};
+        }
+        socialProfiles.set(accountId,snapshot);syncedAccounts++;
+      }
       const gid=String(m.gameId||"");
       if(/^\d{9}$/.test(gid)){
         if(c.gameId&&idToClient.get(c.gameId)===c)idToClient.delete(c.gameId);
@@ -233,6 +255,7 @@ function handleMessage(c,m) {
         if(typeof m.name==="string"&&m.name.trim())p.name=m.name.trim().slice(0,16);
         c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,"#829f60");socialProfiles.set(gid,p);c.playTimeUpdatedAt=Date.now();persistSocial();
       }
+      if(syncedAccounts)persistSocial();
       send(c.ws,{type:"welcome",id:c.id,name:c.name,gameId:c.gameId||null});
       if(c.gameId){const unread=[];for(const list of directMessages.values())for(const item of list){const last=dmReadAt.get(`${c.gameId}:${String(item.fromGameId)}`)||0;if(String(item.toGameId)===c.gameId&&Date.parse(item.createdAt)>last)unread.push(item);}unread.sort((a,b)=>Date.parse(a.createdAt)-Date.parse(b.createdAt));if(unread.length)send(c.ws,{type:"friendDmNotifications",messages:unread.slice(-50)});}
       sendFriendLists(c);if(c.gameId)refreshFriendsOf(c.gameId);
