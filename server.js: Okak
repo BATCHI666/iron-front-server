@@ -1,5 +1,5 @@
 const { WebSocketServer, WebSocket } = require("ws");
-const { randomUUID } = require("crypto");
+const { randomUUID, createHash, timingSafeEqual } = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -180,6 +180,8 @@ function awardKill(room,shot,target) {
 }
 const ADMIN_GAME_ID = "594529725";
 const ADMIN_NAME = "TALBOI";
+// Храним только SHA-256-хеш ключа: исходный секрет не попадает в исходный код.
+const ADMIN_KEY_SHA256 = "4516a6ab149747194c29325b42c047f4570890e0fb9a6deed2dd8cb3db23c8fd";
 function requestCountry(req) {
   const h=req?.headers||{};
   const code=String(h["cf-ipcountry"]||h["x-vercel-ip-country"]||"").trim().toUpperCase();
@@ -195,8 +197,10 @@ function parseDevice(ua) {
   return {os,browser,device};
 }
 function adminAuthorized(c,key) {
-  const expected=String(process.env.IRONFRONT_ADMIN_KEY||"");
-  return Boolean(expected && String(key||"")===expected && c.gameId===ADMIN_GAME_ID && String(c.name||"").toUpperCase()===ADMIN_NAME);
+  const supplied=createHash("sha256").update(String(key||""),"utf8").digest();
+  const expected=Buffer.from(ADMIN_KEY_SHA256,"hex");
+  const keyMatches=supplied.length===expected.length&&timingSafeEqual(supplied,expected);
+  return Boolean(keyMatches && c.gameId===ADMIN_GAME_ID && String(c.name||"").toUpperCase()===ADMIN_NAME);
 }
 function sendAdminPlayers(c,key) {
   if(!adminAuthorized(c,key)){send(c.ws,{type:"adminError",message:"Доступ запрещён. Проверь ID аккаунта и ключ администратора."});return;}
