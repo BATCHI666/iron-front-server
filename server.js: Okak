@@ -200,7 +200,7 @@ function adminAuthorized(c,key) {
   const supplied=createHash("sha256").update(String(key||""),"utf8").digest();
   const expected=Buffer.from(ADMIN_KEY_SHA256,"hex");
   const keyMatches=supplied.length===expected.length&&timingSafeEqual(supplied,expected);
-  return Boolean(keyMatches && c.gameId===ADMIN_GAME_ID && String(c.name||"").toUpperCase()===ADMIN_NAME);
+  return Boolean(keyMatches && c.gameId===ADMIN_GAME_ID);
 }
 function sendAdminPlayers(c,key) {
   if(!adminAuthorized(c,key)){send(c.ws,{type:"adminError",message:"Доступ запрещён. Проверь ID аккаунта и ключ администратора."});return;}
