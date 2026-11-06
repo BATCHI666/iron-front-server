@@ -200,12 +200,13 @@ function adminAuthorized(c,key) {
   const supplied=createHash("sha256").update(String(key||""),"utf8").digest();
   const expected=Buffer.from(ADMIN_KEY_SHA256,"hex");
   const keyMatches=supplied.length===expected.length&&timingSafeEqual(supplied,expected);
-  return Boolean(keyMatches && c.gameId===ADMIN_GAME_ID);
+  const accountName=String(profileFor(c.gameId)?.name||c.name||"").trim().toUpperCase();
+  return Boolean(keyMatches && c.gameId===ADMIN_GAME_ID && accountName===ADMIN_NAME);
 }
-function sendAdminPlayers(c,key,requestId) {
-  if(!adminAuthorized(c,key)){send(c.ws,{type:"adminError",message:"Доступ запрещён. Проверь ID аккаунта и ключ администратора."});return;}
+function sendAdminPlayers(c,key,requestId="") {
+  if(!adminAuthorized(c,key)){send(c.ws,{type:"adminError",requestId,message:"Доступ запрещён. Проверь ID аккаунта, имя TALBOI и секретный код."});return;}
   const players=[...socialProfiles.values()].map(p=>({gameId:p.gameId,name:p.name,created:p.created,registration:p.registration||null})).sort((a,b)=>String(a.name).localeCompare(String(b.name)));
-  send(c.ws,{type:"adminPlayers",players,requestId:String(requestId||"")});
+  send(c.ws,{type:"adminPlayers",requestId,players});
 }
 
 function handleMessage(c,m) {
@@ -250,7 +251,7 @@ function handleMessage(c,m) {
       if(c.roomId){const r=rooms.get(c.roomId),member=r?.players.get(c.id);if(member){member.model=c.tankModel;member.player={...(member.player||{}),model:c.tankModel,color:c.tankColor};}if(r)updateRoom(r);}
       socialProfiles.set(c.gameId,p);persistSocial();sendFriendLists(c);break;
     }
-    case "adminGetPlayers": { sendAdminPlayers(c,m.key,m.requestId); break; }
+    case "adminGetPlayers": { sendAdminPlayers(c,m.key,String(m.requestId||"")); break; }
     case "getLeaderboard": case "leaderboard": case "getTop": case "top": case "requestLeaderboard": case "getRating": case "ratingRequest": case "getTopPlayers": {
       sendLeaderboard(c,m.category||m.sortBy||m.stat||m.key||"kills",m.requestId||"",m.limit||100);break;
     }
