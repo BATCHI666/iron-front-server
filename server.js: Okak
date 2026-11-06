@@ -1,0 +1,374 @@
+const { WebSocketServer, WebSocket } = require("ws");
+const { randomUUID } = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+const PORT = Number(process.env.PORT) || 3000;
+const wss = new WebSocketServer({ port: PORT });
+const clients = new Map(), rooms = new Map();
+const socialProfiles = new Map(), idToClient = new Map();
+const friendships = new Map(), friendRequests = new Map();
+const directMessages = new Map(), dmReadAt = new Map();
+const DATA_DIR = process.env.IRONFRONT_DATA_DIR || __dirname;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+const SOCIAL_DB = path.join(DATA_DIR, "social-data.json");
+
+function getSet(map, key) { if (!map.has(key)) map.set(key, new Set()); return map.get(key); }
+const ALLOWED_TANK_MODELS = new Set(["standard","standard2","t34","t44","t62","is3","sherman","pershing","m48patton","m48german","panther","leopard1","t29","maus","challenger1","centurion","amx30","charb1","type61","type90","type59","ztz99","strv103","cv90120","churchill","amx13","dracula"]);
+function safeTankModel(v) { const m = String(v || "standard"); return ALLOWED_TANK_MODELS.has(m) ? m : "standard"; }
+function safeTankColor(v, fallback = "#829f60") { const c = String(v || ""); return /^#[0-9a-f]{6}$/i.test(c) ? c : fallback; }
+function cleanProfile(raw, gameId, fallbackName = "Игрок") {
+  raw = raw && typeof raw === "object" ? raw : {};
+  return {
+    gameId,
+    name: String(raw.name || fallbackName || "Игрок").trim().slice(0,16) || "Игрок",
+    level: Math.max(1,Math.min(9999,Number(raw.level)||1)),
+    xp: Math.max(0,Math.min(1e9,Number(raw.xp)||0)),
+    kills: Math.max(0,Math.min(1e9,Number(raw.kills)||0)),
+    deaths: Math.max(0,Math.min(1e9,Number(raw.deaths)||0)),
+    matches: Math.max(0,Math.min(1e9,Number(raw.matches)||0)),
+    playTimeSeconds: Math.max(0,Math.min(1e12,Number(raw.playTimeSeconds)||0)),
+    totalCoinsEarned: Math.max(0,Math.min(1e12,Number(raw.totalCoinsEarned)||0)),
+    claimedMedals: [...new Set((Array.isArray(raw.claimedMedals)?raw.claimedMedals:[]).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))].slice(0,6),
+    selectedMedal: String(raw.selectedMedal||""),
+    created: String(raw.created || new Date().toISOString()).slice(0,40),
+    registration: raw.registration && typeof raw.registration === "object" ? { firstSeenAt:String(raw.registration.firstSeenAt||"").slice(0,40), country:String(raw.registration.country||"Нет данных").slice(0,80), region:String(raw.registration.region||"Нет данных").slice(0,80), device:String(raw.registration.device||"Нет данных").slice(0,120), os:String(raw.registration.os||"Нет данных").slice(0,80), browser:String(raw.registration.browser||"Нет данных").slice(0,80) } : null,
+    tankColor: safeTankColor(raw.tankColor,"#e51f2a"),
+    tankModel: safeTankModel(raw.tankModel)
+  };
+}
+function profileFor(id) { return socialProfiles.get(String(id)) || null; }
+function dmKey(a,b) { return [String(a),String(b)].sort().join(":"); }
+function areFriends(a,b) { return getSet(friendships,String(a)).has(String(b)); }
+function loadSocialData() {
+  try {
+    const d = JSON.parse(fs.readFileSync(SOCIAL_DB,"utf8"));
+    for (const p of d.profiles || []) if (p && /^\d{9}$/.test(String(p.gameId))) socialProfiles.set(String(p.gameId),cleanProfile(p,String(p.gameId),p.name));
+    for (const [id,list] of d.friendships || []) friendships.set(String(id),new Set((list||[]).map(String)));
+    for (const [id,list] of d.friendRequests || []) friendRequests.set(String(id),new Set((list||[]).map(String)));
+    for (const [key,list] of d.directMessages || []) directMessages.set(String(key),Array.isArray(list)?list.slice(-300):[]);
+    for (const [id,stamp] of d.dmReadAt || []) dmReadAt.set(String(id),Number(stamp)||0);
+    console.log("Данные игроков загружены:",socialProfiles.size);
+  } catch(e) { if (e.code !== "ENOENT") console.error("Ошибка загрузки данных:",e.message); }
+}
+function persistSocial() {
+  try {
+    const data = {
+      profiles:[...socialProfiles.values()],
+      friendships:[...friendships.entries()].map(([id,s])=>[id,[...s]]),
+      friendRequests:[...friendRequests.entries()].map(([id,s])=>[id,[...s]]),
+      directMessages:[...directMessages.entries()], dmReadAt:[...dmReadAt.entries()]
+    };
+    const tmp = SOCIAL_DB + ".tmp";
+    fs.writeFileSync(tmp,JSON.stringify(data),"utf8"); fs.renameSync(tmp,SOCIAL_DB);
+  } catch(e) { console.error("Не удалось сохранить социальные данные:",e.message); }
+}
+loadSocialData();
+
+function send(ws,data) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data)); }
+function sendError(c,message) { send(c.ws,{type:"error",message}); }
+function broadcastRoom(room,data,exceptId=null) { for (const p of room.players.values()) if (p.id !== exceptId) send(p.ws,data); }
+function isPlayingActivity(a) { return a === "Одиночная игра" || a === "Мультиплеер"; }
+function updatePlayTime(c) {
+  if (!c) return false;
+  const now = Date.now();
+  if (!c.playTimeUpdatedAt) { c.playTimeUpdatedAt = now; return false; }
+  const elapsed = Math.max(0,now-c.playTimeUpdatedAt);
+  if (elapsed < 1000) return false;
+  if (!isPlayingActivity(c.activity) || !c.gameId || !socialProfiles.has(c.gameId)) { c.playTimeUpdatedAt = now; return false; }
+  const seconds = Math.floor(elapsed/1000);
+  if (!seconds) return false;
+  const p = socialProfiles.get(c.gameId); p.playTimeSeconds = Math.max(0,Number(p.playTimeSeconds)||0)+seconds;
+  c.playTimeUpdatedAt += seconds*1000; return true;
+}
+const playTimeTimer = setInterval(()=>{ let changed=false; for (const c of clients.values()) if(updatePlayTime(c)) changed=true; if(changed) persistSocial(); },10000);
+playTimeTimer.unref?.();
+
+const LEADERBOARD_CATEGORIES = ["kills","level","xp","matches","playTimeSeconds"];
+function normalizeLeaderboardCategory(v) {
+  const a={kill:"kills",kills:"kills",убийства:"kills",level:"level",уровни:"level",уровень:"level",xp:"xp",experience:"xp",exp:"xp",опыт:"xp",match:"matches",matches:"matches",games:"matches",матчи:"matches",time:"playTimeSeconds",playtime:"playTimeSeconds",playTime:"playTimeSeconds",playTimeSeconds:"playTimeSeconds",hours:"playTimeSeconds",время:"playTimeSeconds"};
+  return a[String(v||"kills")] || "kills";
+}
+function getLeaderboard(category="kills",limit=100) {
+  category=normalizeLeaderboardCategory(category);
+  const n=Math.max(1,Math.min(100,Math.floor(Number(limit)||100)));
+  return [...socialProfiles.values()].map(p=>({
+    gameId:String(p.gameId),name:String(p.name||"Игрок"),level:Math.max(1,Number(p.level)||1),xp:Math.max(0,Number(p.xp)||0),kills:Math.max(0,Number(p.kills)||0),deaths:Math.max(0,Number(p.deaths)||0),matches:Math.max(0,Number(p.matches)||0),playTimeSeconds:Math.max(0,Number(p.playTimeSeconds)||0),tankColor:safeTankColor(p.tankColor,"#829f60"),tankModel:safeTankModel(p.tankModel)
+  })).sort((a,b)=>(b[category]-a[category]) || a.name.localeCompare(b.name)).slice(0,n).map((p,i)=>({...p,place:i+1,rank:i+1}));
+}
+function sendLeaderboard(c,category="kills",requestId="",limit=100) {
+  if(!c?.ws)return;
+  let changed=false; for(const x of clients.values()) if(updatePlayTime(x)) changed=true; if(changed)persistSocial();
+  if(["all","все"].includes(String(category||""))) {
+    const tops={}; for(const k of LEADERBOARD_CATEGORIES) tops[k]=getLeaderboard(k,limit);
+    send(c.ws,{type:"leaderboard",category:"all",tops,categories:tops,rankings:tops,requestId:String(requestId||"").slice(0,80)}); return;
+  }
+  const cat=normalizeLeaderboardCategory(category), players=getLeaderboard(cat,limit);
+  send(c.ws,{type:"leaderboard",category:cat,sortBy:cat,players,leaderboard:players,data:players,requestId:String(requestId||"").slice(0,80)});
+}
+function profileWithPresence(gameId) {
+  const live=idToClient.get(String(gameId));
+  // Update the live player's server-side clock before returning a public profile.
+  // This prevents friend/profile searches from showing an old play-time snapshot.
+  if(live&&updatePlayTime(live))persistSocial();
+  const p=profileFor(gameId)||{gameId:String(gameId),name:"Игрок "+gameId,level:1,xp:0,kills:0,deaths:0,matches:0,playTimeSeconds:0,totalCoinsEarned:0,claimedMedals:[],selectedMedal:"",created:new Date().toISOString(),tankColor:"#829f60"};
+  const room=live?.roomId?rooms.get(live.roomId):null;
+  let activity=live?.activity||"В меню"; if(room) activity=room.started?"В сетевом бою":"В комнате ожидания";
+  return {...p,online:Boolean(live&&live.ws.readyState===WebSocket.OPEN),activity:live&&live.ws.readyState===WebSocket.OPEN?activity:"Не в сети",roomId:room?.id||null,roomName:room?.name||null,roomStarted:Boolean(room?.started),roomHasPassword:Boolean(room?.password)};
+}
+function sendFriendLists(c) {
+  if(!c.gameId)return;
+  send(c.ws,{type:"friendsList",friends:[...getSet(friendships,c.gameId)].map(profileWithPresence)});
+  send(c.ws,{type:"friendRequests",requests:[...getSet(friendRequests,c.gameId)].map(profileWithPresence)});
+}
+function pushFriendLists(id) { const c=idToClient.get(String(id)); if(c)sendFriendLists(c); }
+function refreshFriendsOf(id) { for(const f of getSet(friendships,String(id)))pushFriendLists(f); pushFriendLists(String(id)); }
+function roomInfo(room) {
+  const members=[...room.players.values()].map(p=>({id:p.id,name:p.name,color:p.player?.color||"#829f60",x:Number.isFinite(p.player?.x)?p.player.x:170,y:Number.isFinite(p.player?.y)?p.player.y:170,angle:Number.isFinite(p.player?.angle)?p.player.angle:0,turret:Number.isFinite(p.player?.turret)?p.player.turret:0,hp:Number.isFinite(p.player?.hp)?p.player.hp:100,maxHp:Number.isFinite(p.player?.maxHp)?p.player.maxHp:100,armor:Number.isFinite(p.player?.armor)?p.player.armor:0,model:safeTankModel(p.player?.model||p.model||"standard")}));
+  return {id:room.id,name:room.name,ownerId:room.hostId,hostId:room.hostId,players:room.players.size,playerNames:members.map(p=>p.name),hasPassword:Boolean(room.password),maxPlayers:room.maxPlayers,started:room.started,members};
+}
+function sendRooms(ws) { send(ws,{type:"rooms",rooms:[...rooms.values()].map(roomInfo)}); }
+function updateRoom(room) {
+  if(rooms.has(room.id)){const info=roomInfo(room);broadcastRoom(room,{type:"roomUpdate",room:info,players:info.members});}
+  for(const c of clients.values())if(!c.roomId)sendRooms(c.ws);
+  for(const p of room.players.values()){const c=clients.get(p.id);if(c?.gameId)refreshFriendsOf(c.gameId);}
+}
+function leaveRoom(c) {
+  if(!c.roomId)return;
+  const room=rooms.get(c.roomId); c.roomId=null;c.player=null;
+  if(!room){send(c.ws,{type:"left"});return;}
+  room.players.delete(c.id);
+  if(room.shots)for(const [id,s] of room.shots)if(s.shooterId===c.id)room.shots.delete(id);
+  if(!room.players.size)rooms.delete(room.id);
+  else {if(room.hostId===c.id)room.hostId=room.players.keys().next().value;const info=roomInfo(room);broadcastRoom(room,{type:"playerLeft",id:c.id,playerId:c.id,room:info});updateRoom(room);}
+  send(c.ws,{type:"left"}); if(c.gameId)refreshFriendsOf(c.gameId);
+}
+function joinRoom(c,requestedId,password="") {
+  const room=rooms.get(String(requestedId||""));
+  if(!room)return sendError(c,"Комната не найдена.");
+  if(room.password&&String(password)!==room.password)return sendError(c,"Неверный пароль комнаты.");
+  if(room.players.size>=room.maxPlayers&&!room.players.has(c.id))return sendError(c,"Комната заполнена.");
+  if(c.roomId===room.id){send(c.ws,{type:"joined",room:roomInfo(room),id:c.id});return;}
+  if(c.roomId)leaveRoom(c);
+  c.roomId=room.id;c.player=null;
+  room.players.set(c.id,{id:c.id,ws:c.ws,name:c.name,model:safeTankModel(c.tankModel),player:{model:safeTankModel(c.tankModel),color:safeTankColor(c.tankColor)}});
+  const info=roomInfo(room);
+  send(c.ws,{type:"joined",room:info,players:info.members,id:c.id});
+  broadcastRoom(room,{type:"playerJoined",id:c.id,playerId:c.id,player:{id:c.id,name:c.name},name:c.name,room:info},c.id);
+  updateRoom(room);
+  if(c.gameId)refreshFriendsOf(c.gameId);
+  if(room.started){const players=[...room.players.values()].map((p,i)=>({id:p.id,name:p.name,color:safeTankColor(p.player?.color||"#829f60"),model:safeTankModel(p.player?.model||p.model),x:Number.isFinite(p.player?.x)?p.player.x:170+(i%4)*85,y:Number.isFinite(p.player?.y)?p.player.y:170+Math.floor(i/4)*85,angle:p.player?.angle||0,turret:p.player?.turret||0,hp:Number.isFinite(p.player?.hp)?p.player.hp:100,maxHp:Number.isFinite(p.player?.maxHp)?p.player.maxHp:100,armor:p.player?.armor||0}));send(c.ws,{type:"started",roomId:room.id,players});}
+}
+function startGame(c) {
+  const room=rooms.get(c.roomId);
+  if(!room)return sendError(c,"Сначала создай комнату или присоединись к ней.");
+  if(room.hostId!==c.id)return sendError(c,"Начать бой может только создатель комнаты.");
+  if(room.started)return sendError(c,"Бой уже начался.");
+  room.started=true;room.claimedCoins=new Set();room.claimedPickups=new Set();room.chatMessageIds=new Set();room.shots=new Map();
+  const members=[...room.players.values()];
+  const players=members.map((p,i)=>{const maxHp=Math.max(1,Math.min(1000,Number(p.player?.maxHp)||100));const state={id:p.id,name:p.name,color:safeTankColor(p.player?.color||"#829f60"),model:safeTankModel(p.player?.model||p.model),x:170+(i%4)*85,y:170+Math.floor(i/4)*85,angle:0,turret:0,hp:maxHp,maxHp,armor:Math.max(0,Number(p.player?.armor)||0),dead:false};p.player=state;return state;});
+  broadcastRoom(room,{type:"started",roomId:room.id,players});updateRoom(room);
+  for(const p of room.players.values()){const x=clients.get(p.id);if(x?.gameId)refreshFriendsOf(x.gameId);}
+}
+function safeNumber(v,def=0){return typeof v==="number"&&Number.isFinite(v)?v:def;}
+function awardKill(room,shot,target) {
+  const shooterClient=clients.get(shot.shooterId), victimClient=clients.get(target.id);
+  if(shooterClient?.gameId){const p=profileFor(shooterClient.gameId);if(p){p.kills=Math.min(1e9,(Number(p.kills)||0)+1);persistSocial();}}
+  if(victimClient?.gameId){const p=profileFor(victimClient.gameId);if(p){p.deaths=Math.min(1e9,(Number(p.deaths)||0)+1);persistSocial();}}
+  broadcastRoom(room,{type:"playerDead",id:target.id,attackerId:shot.shooterId});
+  broadcastRoom(room,{type:"killAward",killerId:shot.shooterId,victimId:target.id,xp:250});
+}
+const ADMIN_GAME_ID = "594529725";
+const ADMIN_NAME = "TALBOI";
+function requestCountry(req) {
+  const h=req?.headers||{};
+  const code=String(h["cf-ipcountry"]||h["x-vercel-ip-country"]||"").trim().toUpperCase();
+  const region=String(h["x-vercel-ip-country-region"]||"").trim();
+  const countryNames={DE:"Германия",AT:"Австрия",RU:"Россия",UA:"Украина",PL:"Польша",US:"США",GB:"Великобритания",FR:"Франция",NL:"Нидерланды",TR:"Турция",KZ:"Казахстан",BY:"Беларусь",CZ:"Чехия",CH:"Швейцария",IT:"Италия",ES:"Испания",CA:"Канада",BR:"Бразилия",IN:"Индия",JP:"Япония"};
+  return {country:countryNames[code]|| (code && code!=="XX" ? code : "Нет данных"),region:region||"Нет данных"};
+}
+function parseDevice(ua) {
+  ua=String(ua||"");
+  const os=/Android/i.test(ua)?"Android":/iPhone|iPad|iPod/i.test(ua)?"iOS":/Windows/i.test(ua)?"Windows":/Mac OS X|Macintosh/i.test(ua)?"macOS":/Linux/i.test(ua)?"Linux":"Не определена";
+  const browser=/Edg\//i.test(ua)?"Edge":/OPR\//i.test(ua)?"Opera":/Firefox\//i.test(ua)?"Firefox":/CriOS\//i.test(ua)?"Chrome (iOS)":/Chrome\//i.test(ua)?"Chrome":/Safari\//i.test(ua)?"Safari":"Не определён";
+  const device=/iPad|Tablet/i.test(ua)?"Планшет":/Mobile|Android|iPhone/i.test(ua)?"Телефон":"Компьютер";
+  return {os,browser,device};
+}
+function adminAuthorized(c,key) {
+  const expected=String(process.env.IRONFRONT_ADMIN_KEY||"");
+  return Boolean(expected && String(key||"")===expected && c.gameId===ADMIN_GAME_ID && String(c.name||"").toUpperCase()===ADMIN_NAME);
+}
+function sendAdminPlayers(c,key) {
+  if(!adminAuthorized(c,key)){send(c.ws,{type:"adminError",message:"Доступ запрещён. Проверь ID аккаунта и ключ администратора."});return;}
+  const players=[...socialProfiles.values()].map(p=>({gameId:p.gameId,name:p.name,created:p.created,registration:p.registration||null})).sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+  send(c.ws,{type:"adminPlayers",players});
+}
+
+function handleMessage(c,m) {
+  if(!m||typeof m.type!=="string")return;
+  switch(m.type){
+    case "hello": case "setName": {
+      if(typeof m.name==="string"&&m.name.trim())c.name=m.name.trim().slice(0,16);
+      const gid=String(m.gameId||"");
+      if(/^\d{9}$/.test(gid)){
+        if(c.gameId&&idToClient.get(c.gameId)===c)idToClient.delete(c.gameId);
+        c.gameId=gid;idToClient.set(gid,c);
+        const old=profileFor(gid),p=cleanProfile(m.profile,gid,c.name);
+        if(!old){
+          const geo=requestCountry({headers:c.requestHeaders||{}});
+          const device=parseDevice(c.userAgent||"");
+          p.registration={firstSeenAt:new Date().toISOString(),country:geo.country,region:geo.region,device:device.device,os:device.os,browser:device.browser};
+        } else if(old.registration) p.registration=old.registration;
+        if(old){
+          p.playTimeSeconds=Math.max(Number(old.playTimeSeconds)||0,Number(p.playTimeSeconds)||0);
+          p.totalCoinsEarned=Math.max(Number(old.totalCoinsEarned)||0,Number(p.totalCoinsEarned)||0);
+          p.claimedMedals=[...new Set([...(old.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
+          if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old.selectedMedal||"";
+        }
+        if(typeof m.name==="string"&&m.name.trim())p.name=m.name.trim().slice(0,16);
+        c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,"#829f60");socialProfiles.set(gid,p);c.playTimeUpdatedAt=Date.now();persistSocial();
+      }
+      send(c.ws,{type:"welcome",id:c.id,name:c.name,gameId:c.gameId||null});
+      if(c.gameId){const unread=[];for(const list of directMessages.values())for(const item of list){const last=dmReadAt.get(`${c.gameId}:${String(item.fromGameId)}`)||0;if(String(item.toGameId)===c.gameId&&Date.parse(item.createdAt)>last)unread.push(item);}unread.sort((a,b)=>Date.parse(a.createdAt)-Date.parse(b.createdAt));if(unread.length)send(c.ws,{type:"friendDmNotifications",messages:unread.slice(-50)});}
+      sendFriendLists(c);if(c.gameId)refreshFriendsOf(c.gameId);
+      if(c.gameId)for(const requesterId of getSet(friendRequests,c.gameId))send(c.ws,{type:"friendRequestReceived",from:requesterId,profile:profileFor(requesterId)});
+      sendRooms(c.ws);break;
+    }
+    case "profileUpdate": {
+      if(!c.gameId)return;
+      const old=profileFor(c.gameId),p=cleanProfile(m.profile,c.gameId,m.name||c.name);
+      p.registration=old?.registration||null;
+      p.playTimeSeconds=Math.max(Number(old?.playTimeSeconds)||0,Number(p.playTimeSeconds)||0);
+      p.totalCoinsEarned=Math.max(Number(old?.totalCoinsEarned)||0,Number(p.totalCoinsEarned)||0);
+      p.claimedMedals=[...new Set([...(old?.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
+      if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old?.selectedMedal||"";
+      c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,c.tankColor||"#829f60");
+      if(c.roomId){const r=rooms.get(c.roomId),member=r?.players.get(c.id);if(member){member.model=c.tankModel;member.player={...(member.player||{}),model:c.tankModel,color:c.tankColor};}if(r)updateRoom(r);}
+      socialProfiles.set(c.gameId,p);persistSocial();sendFriendLists(c);break;
+    }
+    case "adminGetPlayers": { sendAdminPlayers(c,m.key); break; }
+    case "getLeaderboard": case "leaderboard": case "getTop": case "top": case "requestLeaderboard": case "getRating": case "ratingRequest": case "getTopPlayers": {
+      sendLeaderboard(c,m.category||m.sortBy||m.stat||m.key||"kills",m.requestId||"",m.limit||100);break;
+    }
+    case "getAllLeaderboards": case "getTops": case "getAllTops": sendLeaderboard(c,"all",m.requestId||"",m.limit||100);break;
+    case "presenceUpdate": {
+      updatePlayTime(c);const allowed=new Set(["В меню","Одиночная игра","Мультиплеер"]),next=String(m.activity||"");if(allowed.has(next))c.activity=next;c.playTimeUpdatedAt=Date.now();if(c.gameId){refreshFriendsOf(c.gameId);persistSocial();}break;
+    }
+    case "friendConversation": {
+      const other=String(m.withGameId||"");if(!c.gameId||!/^\d{9}$/.test(other)||!areFriends(c.gameId,other)){send(c.ws,{type:"friendError",message:"Личный чат доступен только друзьям."});return;}
+      dmReadAt.set(`${c.gameId}:${other}`,Date.now());persistSocial();send(c.ws,{type:"friendConversation",withGameId:other,requestId:String(m.requestId||"").slice(0,80),messages:directMessages.get(dmKey(c.gameId,other))||[]});break;
+    }
+    case "friendMarkRead": {const other=String(m.withGameId||"");if(!c.gameId||!/^\d{9}$/.test(other)||!areFriends(c.gameId,other))return;dmReadAt.set(`${c.gameId}:${other}`,Date.now());persistSocial();send(c.ws,{type:"friendReadMarked",withGameId:other});break;}
+    case "friendMessage": {
+      const to=String(m.toGameId||""),body=String(m.message||"").trim().slice(0,500);if(!c.gameId||!/^\d{9}$/.test(to)||!areFriends(c.gameId,to)||!body){send(c.ws,{type:"friendError",message:"Сообщения можно отправлять только друзьям."});return;}
+      const entry={messageId:randomUUID(),fromGameId:c.gameId,toGameId:to,fromName:c.name,message:body,createdAt:new Date().toISOString()},key=dmKey(c.gameId,to),history=directMessages.get(key)||[];history.push(entry);directMessages.set(key,history.slice(-300));persistSocial();send(c.ws,{type:"friendMessageSent",...entry,requestId:String(m.requestId||"").slice(0,80)});const target=idToClient.get(to);if(target&&target.ws.readyState===WebSocket.OPEN)send(target.ws,{type:"friendMessageReceived",...entry});break;
+    }
+    case "friendJoin": {
+      const targetId=String(m.gameId||"");if(!c.gameId||!getSet(friendships,c.gameId).has(targetId)){send(c.ws,{type:"friendJoinResult",ok:false,message:"Зайти можно только к игроку из списка друзей."});return;}
+      const target=idToClient.get(targetId);if(!target||target.ws.readyState!==WebSocket.OPEN){send(c.ws,{type:"friendJoinResult",ok:false,message:"Друг сейчас не в сети."});return;}
+      const r=target.roomId?rooms.get(target.roomId):null;if(!r){send(c.ws,{type:"friendJoinResult",ok:false,message:"Друг сейчас не в сетевой комнате. Он может играть в одиночном режиме или находиться в меню."});return;}
+      if(r.players.size>=r.maxPlayers&&!r.players.has(c.id)){send(c.ws,{type:"friendJoinResult",ok:false,message:"Комната друга заполнена."});return;}
+      send(c.ws,{type:"friendRoomFound",roomId:r.id,roomName:r.name,hasPassword:Boolean(r.password),started:Boolean(r.started)});break;
+    }
+    case "friendsList": case "friendRequests": sendFriendLists(c);break;
+    case "friendSearch": {const gid=String(m.gameId||"");send(c.ws,{type:"friendSearchResult",id:gid,profile:/^\d{9}$/.test(gid)&&gid!==c.gameId?profileWithPresence(gid):null});break;}
+    case "friendRequest": {
+      const target=String(m.gameId||"");if(!c.gameId||!/^\d{9}$/.test(target)||target===c.gameId){send(c.ws,{type:"friendError",message:"Нельзя отправить заявку этому игроку."});return;}
+      if(!profileFor(target)){send(c.ws,{type:"friendError",message:"Игрок не найден на сервере. Попроси его один раз подключиться к игре."});return;}
+      if(getSet(friendships,c.gameId).has(target)){send(c.ws,{type:"friendError",message:"Этот игрок уже у тебя в друзьях."});return;}
+      const req=getSet(friendRequests,target);if(req.has(c.gameId)){send(c.ws,{type:"friendError",message:"Заявка уже отправлена."});return;}req.add(c.gameId);persistSocial();send(c.ws,{type:"friendRequestSent",message:"Заявка в друзья отправлена."});const t=idToClient.get(target);if(t)send(t.ws,{type:"friendRequestReceived",from:c.gameId,profile:profileFor(c.gameId)});pushFriendLists(target);break;
+    }
+    case "friendAccept": {
+      const from=String(m.gameId||"");if(!c.gameId||!getSet(friendRequests,c.gameId).has(from)){send(c.ws,{type:"friendError",message:"Заявка не найдена."});return;}
+      getSet(friendRequests,c.gameId).delete(from);getSet(friendships,c.gameId).add(from);getSet(friendships,from).add(c.gameId);persistSocial();send(c.ws,{type:"friendAccepted",gameId:from});const fc=idToClient.get(from);if(fc)send(fc.ws,{type:"friendAccepted",gameId:c.gameId,profile:profileFor(c.gameId)});pushFriendLists(c.gameId);pushFriendLists(from);break;
+    }
+    case "friendDecline": {const from=String(m.gameId||"");if(c.gameId)getSet(friendRequests,c.gameId).delete(from);persistSocial();sendFriendLists(c);break;}
+    case "friendRemove": {const id=String(m.gameId||"");if(c.gameId){getSet(friendships,c.gameId).delete(id);getSet(friendships,id).delete(c.gameId);}persistSocial();send(c.ws,{type:"friendRemoved",gameId:id});pushFriendLists(c.gameId);pushFriendLists(id);break;}
+    case "getRooms": case "listRooms": sendRooms(c.ws);break;
+    case "createRoom": {
+      const name=String(m.name||m.roomName||"").trim().slice(0,28);if(!name){sendError(c,"Введи название комнаты.");return;}if(c.roomId)leaveRoom(c);
+      const maxPlayers=Math.max(2,Math.min(12,Number(m.maxPlayers)||4)),password=String(m.password||"").slice(0,40),id=randomUUID().slice(0,8);
+      const room={id,name,password,hostId:c.id,maxPlayers,players:new Map(),started:false,shots:new Map()};rooms.set(id,room);c.roomId=id;c.player=null;
+      room.players.set(c.id,{id:c.id,ws:c.ws,name:c.name,model:safeTankModel(c.tankModel),player:{model:safeTankModel(c.tankModel),color:safeTankColor(c.tankColor)}});
+      const info=roomInfo(room);send(c.ws,{type:"roomCreated",room:info,roomId:id});send(c.ws,{type:"joined",room:info,players:info.members,id:c.id});updateRoom(room);startGame(c);break;
+    }
+    case "joinRoom": joinRoom(c,m.roomId||m.id||m.room,m.password||"");break;
+    case "leaveRoom": leaveRoom(c);sendRooms(c.ws);break;
+    case "startGame": startGame(c);break;
+    case "state": {
+      const room=rooms.get(c.roomId);if(!room||!room.started||!m.player||!room.players.has(c.id))return;
+      const p=m.player,valid=v=>typeof v==="number"&&Number.isFinite(v);if(!valid(p.x)||!valid(p.y)||Math.abs(p.x)>10000||Math.abs(p.y)>10000)return;
+      const member=room.players.get(c.id),old=member.player||{};
+      const state={x:p.x,y:p.y,angle:valid(p.angle)?p.angle:0,turret:valid(p.turret)?p.turret:0,hp:Math.max(0,Number(old.hp??100)),maxHp:Math.max(1,Math.min(1000,valid(p.maxHp)?p.maxHp:(Number(old.maxHp)||100))),armor:Math.max(0,Math.min(100,Number(old.armor)||0)),dead:Boolean(old.dead),name:c.name,color:safeTankColor(p.color,c.tankColor||"#829f60"),model:safeTankModel(p.model||c.tankModel||"standard")};
+      c.tankModel=state.model;c.tankColor=state.color;c.player=state;member.player=state;
+      broadcastRoom(room,{type:"state",id:c.id,playerId:c.id,player:state},c.id);break;
+    }
+    case "shoot": {
+      const room=rooms.get(c.roomId);if(!room||!room.started||!room.players.has(c.id))return;
+      const shotId=String(m.shotId||"").slice(0,100);if(!shotId||!Number.isFinite(m.x)||!Number.isFinite(m.y)||!Number.isFinite(m.vx)||!Number.isFinite(m.vy))return;
+      if(!room.shots)room.shots=new Map();if(room.shots.has(shotId))return;
+      const damage=Math.max(1,Math.min(100,Number(m.damage)||20));room.shots.set(shotId,{shooterId:c.id,damage,createdAt:Date.now(),resolved:false});
+      for(const [key,s] of room.shots)if(Date.now()-s.createdAt>5000)room.shots.delete(key);
+      broadcastRoom(room,{type:"shoot",id:c.id,playerId:c.id,shotId,x:m.x,y:m.y,vx:m.vx,vy:m.vy,damage},c.id);break;
+    }
+    case "hit": {
+      const room=rooms.get(c.roomId);if(!room||!room.started||!room.shots)return;
+      const shotId=String(m.shotId||"").slice(0,100),targetId=String(m.targetId||""),shot=room.shots.get(shotId),target=room.players.get(targetId);
+      if(!shot||shot.resolved||!target||shot.shooterId===targetId)return;
+      // Разрешаем подтверждение попадания только стрелявшему или получившему снаряд.
+      if(c.id!==shot.shooterId&&c.id!==targetId)return;
+      const shooter=room.players.get(shot.shooterId);if(!shooter?.player||!target.player||target.player.dead||Number(target.player.hp)<=0)return;
+      shot.resolved=true;
+      let damage=shot.damage;const armor=Math.max(0,Number(target.player.armor)||0),absorbed=Math.min(armor,damage);target.player.armor=armor-absorbed;damage-=absorbed;
+      target.player.hp=Math.max(0,Number(target.player.hp)-damage);
+      const payload={type:"damage",targetId,attackerId:shot.shooterId,damage,hp:target.player.hp,armor:target.player.armor};broadcastRoom(room,payload);
+      if(target.player.hp<=0){target.player.dead=true;awardKill(room,shot,target);}
+      room.shots.delete(shotId);break;
+    }
+    case "kill": {
+      // Совместимость с клиентским событием: статистику и смерть определяет сервер через hit.
+      break;
+    }
+    case "playerDead": {
+      const room=rooms.get(c.roomId),member=room?.players.get(c.id);if(!room||!member)return;
+      // Не принимаем HP=0 только по сообщению клиента: смерть подтверждается серверным hit.
+      if(member.player?.dead)broadcastRoom(room,{type:"playerDead",id:c.id,attackerId:null},c.id);
+      break;
+    }
+    case "respawn": {
+      const room=rooms.get(c.roomId),p=m.player;if(!room||!room.started||!p||!Number.isFinite(p.x)||!Number.isFinite(p.y))return;
+      const member=room.players.get(c.id);if(!member)return;
+      if(!member.player?.dead&&Number(member.player?.hp)>0)return;
+      const maxHp=Math.max(1,Math.min(1000,Number(member.player?.maxHp)||Number(p.maxHp)||100));
+      const state={x:Math.max(-10000,Math.min(10000,p.x)),y:Math.max(-10000,Math.min(10000,p.y)),angle:Number.isFinite(p.angle)?p.angle:0,turret:Number.isFinite(p.turret)?p.turret:0,hp:maxHp,maxHp,armor:0,dead:false,name:c.name,color:safeTankColor(p.color,c.tankColor||"#829f60"),model:safeTankModel(p.model||c.tankModel||"standard")};
+      member.player=state;c.player=state;broadcastRoom(room,{type:"respawn",id:c.id,player:state});break;
+    }
+    case "coinCollect": {
+      const room=rooms.get(c.roomId),id=Number(m.coinId);if(!room||!room.started||!Number.isInteger(id)||id<0||id>10000)return;if(!room.claimedCoins)room.claimedCoins=new Set();if(room.claimedCoins.has(id))return;room.claimedCoins.add(id);broadcastRoom(room,{type:"coinCollect",coinId:id,collectorId:c.id});break;
+    }
+    case "pickupCollect": {
+      const room=rooms.get(c.roomId),kind=String(m.kind||""),id=Number(m.pickupId);if(!room||!room.started||!["armor","medkit"].includes(kind)||!Number.isInteger(id)||id<1||id>10000)return;if(!room.claimedPickups)room.claimedPickups=new Set();const key=`${kind}:${id}`;if(room.claimedPickups.has(key))return;room.claimedPickups.add(key);broadcastRoom(room,{type:"pickupCollect",kind,pickupId:id,collectorId:c.id});break;
+    }
+    case "chat": {
+      const room=rooms.get(c.roomId),text=String(m.message||m.text||"").trim().slice(0,180);if(!room||!text)return;
+      const msgId=typeof m.clientMsgId==="string"?m.clientMsgId.slice(0,80):"";if(msgId){if(!room.chatMessageIds)room.chatMessageIds=new Set();if(room.chatMessageIds.has(msgId))return;room.chatMessageIds.add(msgId);if(room.chatMessageIds.size>2000)room.chatMessageIds.clear();}
+      broadcastRoom(room,{type:"chat",id:c.id,name:c.name,message:text,clientMsgId:msgId});break;
+    }
+    default: sendError(c,"Неизвестное событие: "+m.type);
+  }
+}
+
+wss.on("connection",(ws,req)=>{
+  const id=randomUUID(),c={id,ws,name:"Игрок_"+id.slice(0,4),gameId:null,roomId:null,player:null,activity:"В меню",playTimeUpdatedAt:Date.now(),userAgent:String(req?.headers?.["user-agent"]||""),requestHeaders:{"cf-ipcountry":req?.headers?.["cf-ipcountry"],"x-vercel-ip-country":req?.headers?.["x-vercel-ip-country"],"x-vercel-ip-country-region":req?.headers?.["x-vercel-ip-country-region"]}};
+  clients.set(id,c);ws.isAlive=true;ws.on("pong",()=>ws.isAlive=true);
+  send(ws,{type:"welcome",id,name:c.name});sendRooms(ws);
+  ws.on("message",raw=>{try{handleMessage(c,JSON.parse(raw.toString()));}catch(e){console.error("Ошибка обработки сообщения:",e.message);sendError(c,"Не удалось обработать сообщение.");}});
+  ws.on("close",()=>{updatePlayTime(c);persistSocial();leaveRoom(c);clients.delete(id);if(c.gameId&&idToClient.get(c.gameId)===c){idToClient.delete(c.gameId);refreshFriendsOf(c.gameId);}});
+  ws.on("error",e=>console.error("Ошибка WebSocket:",e.message));
+});
+const heartbeatTimer=setInterval(()=>{for(const ws of wss.clients){if(ws.isAlive===false){try{ws.terminate();}catch{}continue;}ws.isAlive=false;try{ws.ping();}catch{try{ws.terminate();}catch{}}}},15000);
+heartbeatTimer.unref?.();
+wss.on("listening",()=>{console.log("==================================");console.log(" IRON FRONT — сервер запущен");console.log(" Адрес: ws://localhost:"+PORT);console.log(" ТОПЫ: включены");console.log(" Игровое время: включено");console.log(" Урон мультиплеера: включён");console.log("==================================");});
+wss.on("error",e=>console.error("Ошибка сервера:",e.message));
+function shutdown(){console.log("Сохранение данных IRON FRONT...");try{for(const c of clients.values())updatePlayTime(c);persistSocial();}finally{wss.close(()=>process.exit(0));setTimeout(()=>process.exit(0),1500).unref();}}
+process.on("SIGTERM",shutdown);process.on("SIGINT",shutdown);
