@@ -31,7 +31,7 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
     totalCoinsEarned: Math.max(0,Math.min(1e12,Number(raw.totalCoinsEarned)||0)),
     claimedMedals: [...new Set((Array.isArray(raw.claimedMedals)?raw.claimedMedals:[]).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))].slice(0,6),
     selectedMedal: String(raw.selectedMedal||""),
-    campaignProgress: { completed: [...new Set((Array.isArray(raw.campaignProgress?.completed)?raw.campaignProgress.completed:[]).map(Number).filter(a=>[1,2,3].includes(a)))].sort() },
+    campaignProgress: { completed: [...new Set((Array.isArray(raw.campaignProgress?.completed)?raw.campaignProgress.completed:[]).map(Number).filter(a=>[1,2,3,4].includes(a)))].sort() },
     created: String(raw.created || new Date().toISOString()).slice(0,40),
     registration: raw.registration && typeof raw.registration === "object" ? { firstSeenAt:String(raw.registration.firstSeenAt||"").slice(0,40), country:String(raw.registration.country||"Нет данных").slice(0,80), region:String(raw.registration.region||"Нет данных").slice(0,80), device:String(raw.registration.device||"Нет данных").slice(0,120), os:String(raw.registration.os||"Нет данных").slice(0,80), browser:String(raw.registration.browser||"Нет данных").slice(0,80) } : null,
     tankColor: safeTankColor(raw.tankColor,"#e51f2a"),
