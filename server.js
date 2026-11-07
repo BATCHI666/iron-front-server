@@ -31,6 +31,7 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
     totalCoinsEarned: Math.max(0,Math.min(1e12,Number(raw.totalCoinsEarned)||0)),
     claimedMedals: [...new Set((Array.isArray(raw.claimedMedals)?raw.claimedMedals:[]).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))].slice(0,6),
     selectedMedal: String(raw.selectedMedal||""),
+    campaignProgress: { completed: [...new Set((Array.isArray(raw.campaignProgress?.completed)?raw.campaignProgress.completed:[]).map(Number).filter(a=>[1,2,3].includes(a)))].sort() },
     created: String(raw.created || new Date().toISOString()).slice(0,40),
     registration: raw.registration && typeof raw.registration === "object" ? { firstSeenAt:String(raw.registration.firstSeenAt||"").slice(0,40), country:String(raw.registration.country||"Нет данных").slice(0,80), region:String(raw.registration.region||"Нет данных").slice(0,80), device:String(raw.registration.device||"Нет данных").slice(0,120), os:String(raw.registration.os||"Нет данных").slice(0,80), browser:String(raw.registration.browser||"Нет данных").slice(0,80) } : null,
     tankColor: safeTankColor(raw.tankColor,"#e51f2a"),
@@ -228,6 +229,7 @@ function handleMessage(c,m) {
           snapshot.playTimeSeconds=Math.max(Number(previous.playTimeSeconds)||0,Number(snapshot.playTimeSeconds)||0);
           snapshot.totalCoinsEarned=Math.max(Number(previous.totalCoinsEarned)||0,Number(snapshot.totalCoinsEarned)||0);
           snapshot.claimedMedals=[...new Set([...(previous.claimedMedals||[]),...(snapshot.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
+          snapshot.campaignProgress.completed=[...new Set([...(previous.campaignProgress?.completed||[]),...(snapshot.campaignProgress?.completed||[])])].sort();
           if(!snapshot.selectedMedal||!snapshot.claimedMedals.includes(snapshot.selectedMedal))snapshot.selectedMedal=previous.selectedMedal||"";
         } else {
           const geo=requestCountry({headers:c.requestHeaders||{}});
@@ -250,6 +252,7 @@ function handleMessage(c,m) {
           p.playTimeSeconds=Math.max(Number(old.playTimeSeconds)||0,Number(p.playTimeSeconds)||0);
           p.totalCoinsEarned=Math.max(Number(old.totalCoinsEarned)||0,Number(p.totalCoinsEarned)||0);
           p.claimedMedals=[...new Set([...(old.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
+          p.campaignProgress.completed=[...new Set([...(old.campaignProgress?.completed||[]),...(p.campaignProgress?.completed||[])])].sort();
           if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old.selectedMedal||"";
         }
         if(typeof m.name==="string"&&m.name.trim())p.name=m.name.trim().slice(0,16);
@@ -269,6 +272,7 @@ function handleMessage(c,m) {
       p.playTimeSeconds=Math.max(Number(old?.playTimeSeconds)||0,Number(p.playTimeSeconds)||0);
       p.totalCoinsEarned=Math.max(Number(old?.totalCoinsEarned)||0,Number(p.totalCoinsEarned)||0);
       p.claimedMedals=[...new Set([...(old?.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
+      p.campaignProgress.completed=[...new Set([...(old?.campaignProgress?.completed||[]),...(p.campaignProgress?.completed||[])])].sort();
       if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old?.selectedMedal||"";
       c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,c.tankColor||"#829f60");
       if(c.roomId){const r=rooms.get(c.roomId),member=r?.players.get(c.id);if(member){member.model=c.tankModel;member.player={...(member.player||{}),model:c.tankModel,color:c.tankColor};}if(r)updateRoom(r);}
