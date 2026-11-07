@@ -21,7 +21,7 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
   raw = raw && typeof raw === "object" ? raw : {};
   return {
     gameId,
-    name: String(raw.name || fallbackName || "Игрок").trim().slice(0,16) || "Игрок",
+    name: String(raw.name || fallbackName || "Игрок").trim().slice(0,14) || "Игрок",
     level: Math.max(1,Math.min(9999,Number(raw.level)||1)),
     xp: Math.max(0,Math.min(1e9,Number(raw.xp)||0)),
     kills: Math.max(0,Math.min(1e9,Number(raw.kills)||0)),
@@ -214,7 +214,7 @@ function handleMessage(c,m) {
   if(!m||typeof m.type!=="string")return;
   switch(m.type){
     case "hello": case "setName": {
-      if(typeof m.name==="string"&&m.name.trim())c.name=m.name.trim().slice(0,16);
+      if(typeof m.name==="string"&&m.name.trim())c.name=m.name.trim().slice(0,14);
       // Sync every locally registered account, not only the currently selected/online one.
       // The browser stores multiple accounts locally; the server keeps a persistent directory.
       let syncedAccounts=0;
@@ -255,7 +255,7 @@ function handleMessage(c,m) {
           p.campaignProgress.completed=[...new Set([...(old.campaignProgress?.completed||[]),...(p.campaignProgress?.completed||[])])].sort();
           if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old.selectedMedal||"";
         }
-        if(typeof m.name==="string"&&m.name.trim())p.name=m.name.trim().slice(0,16);
+        if(typeof m.name==="string"&&m.name.trim())p.name=m.name.trim().slice(0,14);
         c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,"#829f60");socialProfiles.set(gid,p);c.playTimeUpdatedAt=Date.now();persistSocial();
       }
       if(syncedAccounts)persistSocial();
