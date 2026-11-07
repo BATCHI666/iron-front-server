@@ -29,6 +29,8 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
     matches: Math.max(0,Math.min(1e9,Number(raw.matches)||0)),
     playTimeSeconds: Math.max(0,Math.min(1e12,Number(raw.playTimeSeconds)||0)),
     totalCoinsEarned: Math.max(0,Math.min(1e12,Number(raw.totalCoinsEarned)||0)),
+    coins: Math.max(0,Math.min(1e12,Number(raw.coins)||0)),
+    adminCoinGrantTotal: Math.max(0,Math.min(1e12,Number(raw.adminCoinGrantTotal)||0)),
     claimedMedals: [...new Set((Array.isArray(raw.claimedMedals)?raw.claimedMedals:[]).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))].slice(0,6),
     selectedMedal: String(raw.selectedMedal||""),
     campaignProgress: { completed: [...new Set((Array.isArray(raw.campaignProgress?.completed)?raw.campaignProgress.completed:[]).map(Number).filter(a=>[1,2,3,4].includes(a)))].sort() },
@@ -39,6 +41,15 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
   };
 }
 function profileFor(id) { return socialProfiles.get(String(id)) || null; }
+function mergeAdminCoinGrants(incoming,previous) {
+  const granted=Math.max(0,Number(previous?.adminCoinGrantTotal)||0);
+  const acknowledged=Math.max(0,Number(incoming.adminCoinGrantTotal)||0);
+  const delta=Math.max(0,granted-acknowledged);
+  incoming.coins=Math.min(1e12,Math.max(0,Number(incoming.coins)||0)+delta);
+  incoming.totalCoinsEarned=Math.min(1e12,Math.max(Number(previous?.totalCoinsEarned)||0,(Number(incoming.totalCoinsEarned)||0)+delta));
+  incoming.adminCoinGrantTotal=Math.max(granted,acknowledged);
+  return incoming;
+}
 function dmKey(a,b) { return [String(a),String(b)].sort().join(":"); }
 function areFriends(a,b) { return getSet(friendships,String(a)).has(String(b)); }
 function loadSocialData() {
@@ -206,7 +217,7 @@ function adminAuthorized(c,key) {
 }
 function sendAdminPlayers(c,key,requestId="") {
   if(!adminAuthorized(c,key)){send(c.ws,{type:"adminError",requestId,message:"Доступ запрещён. Проверь ID аккаунта, имя TALBOI и секретный код."});return;}
-  const players=[...socialProfiles.values()].map(p=>({gameId:p.gameId,name:p.name,created:p.created,registration:p.registration||null})).sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+  const players=[...socialProfiles.values()].map(p=>({gameId:p.gameId,name:p.name,coins:Number(p.coins)||0,created:p.created,registration:p.registration||null})).sort((a,b)=>String(a.name).localeCompare(String(b.name)));
   send(c.ws,{type:"adminPlayers",requestId,players});
 }
 
@@ -227,7 +238,7 @@ function handleMessage(c,m) {
           snapshot.created=previous.created||snapshot.created;
           snapshot.registration=previous.registration||snapshot.registration;
           snapshot.playTimeSeconds=Math.max(Number(previous.playTimeSeconds)||0,Number(snapshot.playTimeSeconds)||0);
-          snapshot.totalCoinsEarned=Math.max(Number(previous.totalCoinsEarned)||0,Number(snapshot.totalCoinsEarned)||0);
+          mergeAdminCoinGrants(snapshot,previous);
           snapshot.claimedMedals=[...new Set([...(previous.claimedMedals||[]),...(snapshot.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
           snapshot.campaignProgress.completed=[...new Set([...(previous.campaignProgress?.completed||[]),...(snapshot.campaignProgress?.completed||[])])].sort();
           if(!snapshot.selectedMedal||!snapshot.claimedMedals.includes(snapshot.selectedMedal))snapshot.selectedMedal=previous.selectedMedal||"";
@@ -250,13 +261,13 @@ function handleMessage(c,m) {
         } else if(old.registration) p.registration=old.registration;
         if(old){
           p.playTimeSeconds=Math.max(Number(old.playTimeSeconds)||0,Number(p.playTimeSeconds)||0);
-          p.totalCoinsEarned=Math.max(Number(old.totalCoinsEarned)||0,Number(p.totalCoinsEarned)||0);
+          mergeAdminCoinGrants(p,old);
           p.claimedMedals=[...new Set([...(old.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
           p.campaignProgress.completed=[...new Set([...(old.campaignProgress?.completed||[]),...(p.campaignProgress?.completed||[])])].sort();
           if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old.selectedMedal||"";
         }
         if(typeof m.name==="string"&&m.name.trim())p.name=m.name.trim().slice(0,14);
-        c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,"#829f60");socialProfiles.set(gid,p);c.playTimeUpdatedAt=Date.now();persistSocial();
+        c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,"#829f60");socialProfiles.set(gid,p);c.playTimeUpdatedAt=Date.now();persistSocial();send(c.ws,{type:"profileServerSync",gameId:gid,coins:p.coins,totalCoinsEarned:p.totalCoinsEarned,adminCoinGrantTotal:p.adminCoinGrantTotal});
       }
       if(syncedAccounts)persistSocial();
       send(c.ws,{type:"welcome",id:c.id,name:c.name,gameId:c.gameId||null});
@@ -271,6 +282,7 @@ function handleMessage(c,m) {
       p.registration=old?.registration||null;
       p.playTimeSeconds=Math.max(Number(old?.playTimeSeconds)||0,Number(p.playTimeSeconds)||0);
       p.totalCoinsEarned=Math.max(Number(old?.totalCoinsEarned)||0,Number(p.totalCoinsEarned)||0);
+      p.adminCoinGrantTotal=Math.max(Number(old?.adminCoinGrantTotal)||0,Number(p.adminCoinGrantTotal)||0);
       p.claimedMedals=[...new Set([...(old?.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
       p.campaignProgress.completed=[...new Set([...(old?.campaignProgress?.completed||[]),...(p.campaignProgress?.completed||[])])].sort();
       if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old?.selectedMedal||"";
@@ -279,6 +291,22 @@ function handleMessage(c,m) {
       socialProfiles.set(c.gameId,p);persistSocial();sendFriendLists(c);break;
     }
     case "adminGetPlayers": { sendAdminPlayers(c,m.key,String(m.requestId||"")); break; }
+    case "adminCommand": {
+      if(!adminAuthorized(c,m.key)){send(c.ws,{type:"adminError",message:"Доступ запрещён."});return;}
+      const command=String(m.command||"").trim(),match=command.match(/^\/coin\s+(\d{1,12})\s+(\d{9})$/i);
+      if(!match){send(c.ws,{type:"adminCommandResult",ok:false,message:"Формат команды: /coin число айди"});return;}
+      const amount=Number(match[1]),targetId=match[2];
+      if(!Number.isSafeInteger(amount)||amount<1||amount>1000000000){send(c.ws,{type:"adminCommandResult",ok:false,message:"Количество монет должно быть от 1 до 1 000 000 000."});return;}
+      const target=profileFor(targetId);
+      if(!target){send(c.ws,{type:"adminCommandResult",ok:false,message:"Аккаунт с таким ID не найден. Игрок должен хотя бы раз подключиться к серверу."});return;}
+      target.coins=Math.min(1e12,(Number(target.coins)||0)+amount);
+      target.totalCoinsEarned=Math.min(1e12,(Number(target.totalCoinsEarned)||0)+amount);
+      target.adminCoinGrantTotal=Math.min(1e12,(Number(target.adminCoinGrantTotal)||0)+amount);
+      persistSocial();
+      const online=idToClient.get(targetId);if(online)send(online.ws,{type:"adminCoinGrant",gameId:targetId,coins:target.coins,totalCoinsEarned:target.totalCoinsEarned,adminCoinGrantTotal:target.adminCoinGrantTotal});
+      send(c.ws,{type:"adminCommandResult",ok:true,message:"Выдано "+amount.toLocaleString("ru-RU")+" монет игроку "+target.name+" (ID "+targetId+")."});
+      break;
+    }
     case "getLeaderboard": case "leaderboard": case "getTop": case "top": case "requestLeaderboard": case "getRating": case "ratingRequest": case "getTopPlayers": {
       sendLeaderboard(c,m.category||m.sortBy||m.stat||m.key||"kills",m.requestId||"",m.limit||100);break;
     }
