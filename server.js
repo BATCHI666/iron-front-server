@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = Number(process.env.PORT) || 3000;
+// IRON FRONT server v1.8.37 — daily quests engine
 const wss = new WebSocketServer({ port: PORT });
 const clients = new Map(), rooms = new Map();
 const socialProfiles = new Map(), idToClient = new Map();
@@ -17,6 +18,45 @@ function getSet(map, key) { if (!map.has(key)) map.set(key, new Set()); return m
 const ALLOWED_TANK_MODELS = new Set(["standard","standard2","t34","sherman","panther","m48patton","pershing","t29","is3","t44","t62","maus","leopard1","m48german","challenger1","centurion","amx30","charb1","type61","type90","type59","ztz99","strv103","cv90120","churchill","amx13","ruby","dracula","xonex"]);
 function safeTankModel(v) { const m = String(v || "standard"); return ALLOWED_TANK_MODELS.has(m) ? m : "standard"; }
 function safeTankColor(v, fallback = "#829f60") { const c = String(v || ""); return /^#[0-9a-f]{6}$/i.test(c) ? c : fallback; }
+const DAILY_QUESTS = {
+  kills5:{title:"Танковый ас",description:"Уничтожь 5 вражеских танков",kind:"kills",target:5,reward:25},
+  kills8:{title:"Охотник",description:"Уничтожь 8 вражеских танков",kind:"kills",target:8,reward:35},
+  kills12:{title:"Стальной кошмар",description:"Уничтожь 12 вражеских танков",kind:"kills",target:12,reward:50},
+  deaths2:{title:"До последнего",description:"Проведи 2 боя до поражения",kind:"deaths",target:2,reward:30},
+  crates3:{title:"Сбор припасов",description:"Разбей 3 ящика",kind:"crates",target:3,reward:25},
+  crates6:{title:"Разрушитель складов",description:"Разбей 6 ящиков",kind:"crates",target:6,reward:40},
+  play5:{title:"На боевом посту",description:"Проведи в игре 5 минут",kind:"play",target:300,reward:30},
+  play12:{title:"Несокрушимый",description:"Проведи в игре 12 минут",kind:"play",target:720,reward:55}
+};
+const DAILY_QUEST_IDS = new Set(Object.keys(DAILY_QUESTS));
+function dailyQuestDate(){return new Date().toISOString().slice(0,10)}
+function makeDailyQuests(){
+  const ids=[...DAILY_QUEST_IDS];
+  for(let i=ids.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[ids[i],ids[j]]=[ids[j],ids[i]];}
+  return {date:dailyQuestDate(),tasks:ids.slice(0,3).map(id=>({id,progress:0,claimed:false}))};
+}
+function ensureDailyQuests(p){
+  if(!p.dailyQuests||p.dailyQuests.date!==dailyQuestDate())p.dailyQuests=makeDailyQuests();
+  return p.dailyQuests;
+}
+function addDailyQuestProgress(p,kind,amount){
+  const q=ensureDailyQuests(p),n=Math.max(0,Number(amount)||0);if(!n)return false;
+  let changed=false;
+  for(const task of q.tasks){const def=DAILY_QUESTS[task.id];if(def&&def.kind===kind&&!task.claimed){const next=Math.min(def.target,task.progress+n);if(next!==task.progress){task.progress=next;changed=true;}}}
+  return changed;
+}
+function sendDailyQuests(c){const p=c?.gameId&&profileFor(c.gameId);if(!p)return;ensureDailyQuests(p);persistSocial();send(c.ws,{type:"dailyQuestsUpdate",dailyQuests:p.dailyQuests,coins:p.coins});}
+function cleanDailyQuests(value) {
+  if(!value || typeof value!=="object" || !/^\d{4}-\d{2}-\d{2}$/.test(String(value.date||""))) return null;
+  const tasks=Array.isArray(value.tasks)?value.tasks.slice(0,3).filter(t=>t&&DAILY_QUEST_IDS.has(String(t.id||""))).map(t=>({id:String(t.id),progress:Math.max(0,Math.min(1000,Number(t.progress)||0)),claimed:!!t.claimed})):[];
+  return tasks.length===3?{date:String(value.date),tasks}:null;
+}
+function mergeDailyQuests(incoming,previous) {
+  const a=cleanDailyQuests(incoming),b=cleanDailyQuests(previous);
+  if(!a)return b;if(!b||a.date>b.date)return a;if(a.date<b.date)return b;
+  const byId=new Map(b.tasks.map(t=>[t.id,t]));
+  return {...a,tasks:a.tasks.map(t=>{const old=byId.get(t.id);return old?{...t,progress:Math.max(t.progress,old.progress),claimed:t.claimed||old.claimed}:t})};
+}
 function cleanProfile(raw, gameId, fallbackName = "Игрок") {
   raw = raw && typeof raw === "object" ? raw : {};
   return {
@@ -34,9 +74,11 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
     claimedMedals: [...new Set((Array.isArray(raw.claimedMedals)?raw.claimedMedals:(Array.isArray(raw.medals)?raw.medals:[])).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))].slice(0,6),
     selectedMedal: String(raw.selectedMedal||""),
     campaignProgress: { completed: [...new Set((Array.isArray(raw.campaignProgress?.completed)?raw.campaignProgress.completed:[]).map(Number).filter(a=>[1,2,3,4].includes(a)))].sort() },
+    dailyQuests: cleanDailyQuests(raw.dailyQuests),
     created: String(raw.created || new Date().toISOString()).slice(0,40),
     registration: raw.registration && typeof raw.registration === "object" ? { firstSeenAt:String(raw.registration.firstSeenAt||"").slice(0,40), country:String(raw.registration.country||"Нет данных").slice(0,80), region:String(raw.registration.region||"Нет данных").slice(0,80), device:String(raw.registration.device||"Нет данных").slice(0,120), os:String(raw.registration.os||"Нет данных").slice(0,80), browser:String(raw.registration.browser||"Нет данных").slice(0,80) } : null,
     tankColor: safeTankColor(raw.tankColor,"#e51f2a"),
+    tankModelColors: Object.fromEntries(Object.entries(raw.tankModelColors && typeof raw.tankModelColors === "object" && !Array.isArray(raw.tankModelColors) ? raw.tankModelColors : {}).filter(([id,color]) => ALLOWED_TANK_MODELS.has(id) && /^#[0-9a-f]{6}$/i.test(String(color))).map(([id,color]) => [id,safeTankColor(color,"#e51f2a")])),
     tankModel: safeTankModel(raw.tankModel),
     selectedBarrel: String(raw.selectedBarrel||"standard").slice(0,40),
     ban: raw.ban && Number(raw.ban.until)>0 ? {until:Math.min(Date.now()+365*86400000,Number(raw.ban.until)),reason:String(raw.ban.reason||"Не указана").slice(0,200),issuedAt:String(raw.ban.issuedAt||new Date().toISOString()).slice(0,40)} : null
@@ -133,6 +175,7 @@ function profileWithPresence(gameId) {
     selectedMedal:String(p.selectedMedal||""),
     tankModel:safeTankModel(p.tankModel||live?.tankModel||"standard"),
     tankColor:safeTankColor(p.tankColor||live?.tankColor,"#e51f2a"),
+    tankModelColors:p.tankModelColors && typeof p.tankModelColors === "object" ? p.tankModelColors : {},
     selectedBarrel:String(p.selectedBarrel||"standard"),
     online:Boolean(live&&live.ws.readyState===WebSocket.OPEN),activity:live&&live.ws.readyState===WebSocket.OPEN?activity:"Не в сети",roomId:room?.id||null,roomName:room?.name||null,roomStarted:Boolean(room?.started),roomHasPassword:Boolean(room?.password)};
 }
@@ -255,6 +298,7 @@ function handleMessage(c,m) {
           snapshot.registration=previous.registration||snapshot.registration;
           snapshot.ban=previous.ban||null;
           snapshot.playTimeSeconds=Math.max(Number(previous.playTimeSeconds)||0,Number(snapshot.playTimeSeconds)||0);
+          snapshot.dailyQuests=mergeDailyQuests(snapshot.dailyQuests,previous.dailyQuests);
           mergeAdminCoinGrants(snapshot,previous);
           snapshot.claimedMedals=[...new Set([...(previous.claimedMedals||[]),...(snapshot.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
           snapshot.campaignProgress.completed=[...new Set([...(previous.campaignProgress?.completed||[]),...(snapshot.campaignProgress?.completed||[])])].sort();
@@ -283,10 +327,12 @@ function handleMessage(c,m) {
           mergeAdminCoinGrants(p,old);
           p.claimedMedals=[...new Set([...(old.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
           p.campaignProgress.completed=[...new Set([...(old.campaignProgress?.completed||[]),...(p.campaignProgress?.completed||[])])].sort();
+          p.dailyQuests=mergeDailyQuests(p.dailyQuests,old.dailyQuests);
           if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old.selectedMedal||"";
         }
         if(typeof m.name==="string"&&m.name.trim())p.name=m.name.trim().slice(0,14);
-        c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,"#829f60");socialProfiles.set(gid,p);c.playTimeUpdatedAt=Date.now();persistSocial();send(c.ws,{type:"profileServerSync",gameId:gid,coins:p.coins,totalCoinsEarned:p.totalCoinsEarned,adminCoinGrantTotal:p.adminCoinGrantTotal});
+        ensureDailyQuests(p);
+        c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,"#829f60");socialProfiles.set(gid,p);c.playTimeUpdatedAt=Date.now();persistSocial();send(c.ws,{type:"profileServerSync",gameId:gid,coins:p.coins,totalCoinsEarned:p.totalCoinsEarned,adminCoinGrantTotal:p.adminCoinGrantTotal,dailyQuests:p.dailyQuests});
       }
       if(syncedAccounts)persistSocial();
       send(c.ws,{type:"welcome",id:c.id,name:c.name,gameId:c.gameId||null});
@@ -306,10 +352,35 @@ function handleMessage(c,m) {
       p.adminCoinGrantTotal=Math.max(Number(old?.adminCoinGrantTotal)||0,Number(p.adminCoinGrantTotal)||0);
       p.claimedMedals=[...new Set([...(old?.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
       p.campaignProgress.completed=[...new Set([...(old?.campaignProgress?.completed||[]),...(p.campaignProgress?.completed||[])])].sort();
+      p.dailyQuests=mergeDailyQuests(p.dailyQuests,old?.dailyQuests);ensureDailyQuests(p);
       if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old?.selectedMedal||"";
       c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,c.tankColor||"#829f60");
       if(c.roomId){const r=rooms.get(c.roomId),member=r?.players.get(c.id);if(member){member.model=c.tankModel;member.player={...(member.player||{}),model:c.tankModel,color:c.tankColor};}if(r)updateRoom(r);}
-      socialProfiles.set(c.gameId,p);persistSocial();sendFriendLists(c);refreshFriendsOf(c.gameId);break;
+      socialProfiles.set(c.gameId,p);persistSocial();send(c.ws,{type:"profileServerSync",gameId:c.gameId,coins:p.coins,totalCoinsEarned:p.totalCoinsEarned,adminCoinGrantTotal:p.adminCoinGrantTotal,dailyQuests:p.dailyQuests});sendFriendLists(c);refreshFriendsOf(c.gameId);break;
+    }
+    case "getDailyQuests": { sendDailyQuests(c); break; }
+    case "dailyQuestProgress": {
+      const p=c.gameId&&profileFor(c.gameId);if(!p)return;
+      const kind=String(m.kind||"");if(!["kills","deaths","crates","play"].includes(kind))return;
+      const amount=Math.max(0,Math.min(20,Math.floor(Number(m.amount)||0)));if(!amount)return;
+      if(addDailyQuestProgress(p,kind,amount)){persistSocial();send(c.ws,{type:"dailyQuestsUpdate",dailyQuests:p.dailyQuests,coins:p.coins});}
+      break;
+    }
+    case "claimDailyQuest": {
+      const p=c.gameId&&profileFor(c.gameId);if(!p)return;const q=ensureDailyQuests(p),task=q.tasks.find(t=>t.id===String(m.id||"")),def=task&&DAILY_QUESTS[task.id];
+      if(!task||!def||task.claimed||task.progress<def.target){send(c.ws,{type:"dailyQuestActionResult",ok:false,message:"Задание ещё не выполнено или награда уже получена.",dailyQuests:q});return;}
+      task.claimed=true;p.coins=Math.min(1e12,(Number(p.coins)||0)+def.reward);p.totalCoinsEarned=Math.min(1e12,(Number(p.totalCoinsEarned)||0)+def.reward);persistSocial();
+      send(c.ws,{type:"dailyQuestActionResult",ok:true,message:"Получено "+def.reward+" монет!",dailyQuests:q,coins:p.coins,totalCoinsEarned:p.totalCoinsEarned});
+      send(c.ws,{type:"profileServerSync",gameId:c.gameId,coins:p.coins,totalCoinsEarned:p.totalCoinsEarned,adminCoinGrantTotal:p.adminCoinGrantTotal,dailyQuests:q});break;
+    }
+    case "replaceDailyQuest": {
+      const p=c.gameId&&profileFor(c.gameId);if(!p)return;const q=ensureDailyQuests(p),task=q.tasks.find(t=>t.id===String(m.id||""));
+      if(!task||task.claimed||task.progress>0){send(c.ws,{type:"dailyQuestActionResult",ok:false,message:"Можно заменить только задание без прогресса.",dailyQuests:q});return;}
+      if((Number(p.coins)||0)<50){send(c.ws,{type:"dailyQuestActionResult",ok:false,message:"Для замены нужно 50 монет.",dailyQuests:q,coins:p.coins});return;}
+      const used=new Set(q.tasks.map(t=>t.id));const choices=[...DAILY_QUEST_IDS].filter(id=>!used.has(id));if(!choices.length){send(c.ws,{type:"dailyQuestActionResult",ok:false,message:"Нет других заданий для замены.",dailyQuests:q});return;}
+      p.coins-=50;task.id=choices[Math.floor(Math.random()*choices.length)];task.progress=0;task.claimed=false;persistSocial();
+      send(c.ws,{type:"dailyQuestActionResult",ok:true,message:"Задание заменено за 50 монет.",dailyQuests:q,coins:p.coins,totalCoinsEarned:p.totalCoinsEarned});
+      send(c.ws,{type:"profileServerSync",gameId:c.gameId,coins:p.coins,totalCoinsEarned:p.totalCoinsEarned,adminCoinGrantTotal:p.adminCoinGrantTotal,dailyQuests:q});break;
     }
     case "adminGetPlayers": { sendAdminPlayers(c,m.key,String(m.requestId||"")); break; }
     case "adminCommand": {
