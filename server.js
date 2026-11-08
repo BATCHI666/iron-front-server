@@ -172,7 +172,7 @@ function profileWithPresence(gameId) {
   let activity=live?.activity||"В меню"; if(room) activity=room.started?"В сетевом бою":"В комнате ожидания";
   const selectedModel=safeTankModel(p.tankModel||live?.tankModel||"standard");
   const modelColors=p.tankModelColors && typeof p.tankModelColors === "object" ? p.tankModelColors : {};
-  const selectedColor=safeTankColor(modelColors[selectedModel]||(selectedModel==="standard"?p.tankColor:(p.tankColor||live?.tankColor)),"#e51f2a");
+  const selectedColor=safeTankColor(modelColors[selectedModel]||p.tankColor||(selectedModel==="standard"?"#e51f2a":"#81936c"),"#e51f2a");
   return {...p,
     claimedMedals:[...new Set((Array.isArray(p.claimedMedals)?p.claimedMedals:[]).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))],
     selectedMedal:String(p.selectedMedal||""),
