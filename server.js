@@ -170,12 +170,15 @@ function profileWithPresence(gameId) {
   const p=profileFor(gameId)||{gameId:String(gameId),name:"Игрок "+gameId,level:1,xp:0,kills:0,deaths:0,matches:0,playTimeSeconds:0,totalCoinsEarned:0,claimedMedals:[],selectedMedal:"",created:new Date().toISOString(),tankColor:"#829f60"};
   const room=live?.roomId?rooms.get(live.roomId):null;
   let activity=live?.activity||"В меню"; if(room) activity=room.started?"В сетевом бою":"В комнате ожидания";
+  const selectedModel=safeTankModel(p.tankModel||live?.tankModel||"standard");
+  const modelColors=p.tankModelColors && typeof p.tankModelColors === "object" ? p.tankModelColors : {};
+  const selectedColor=safeTankColor(modelColors[selectedModel]||(selectedModel==="standard"?p.tankColor:(p.tankColor||live?.tankColor)),"#e51f2a");
   return {...p,
     claimedMedals:[...new Set((Array.isArray(p.claimedMedals)?p.claimedMedals:[]).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))],
     selectedMedal:String(p.selectedMedal||""),
-    tankModel:safeTankModel(p.tankModel||live?.tankModel||"standard"),
-    tankColor:safeTankColor(p.tankColor||live?.tankColor,"#e51f2a"),
-    tankModelColors:p.tankModelColors && typeof p.tankModelColors === "object" ? p.tankModelColors : {},
+    tankModel:selectedModel,
+    tankColor:selectedColor,
+    tankModelColors:modelColors,
     selectedBarrel:String(p.selectedBarrel||"standard"),
     online:Boolean(live&&live.ws.readyState===WebSocket.OPEN),activity:live&&live.ws.readyState===WebSocket.OPEN?activity:"Не в сети",roomId:room?.id||null,roomName:room?.name||null,roomStarted:Boolean(room?.started),roomHasPassword:Boolean(room?.password)};
 }
