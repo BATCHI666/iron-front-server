@@ -14,7 +14,7 @@ try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
 const SOCIAL_DB = path.join(DATA_DIR, "social-data.json");
 
 function getSet(map, key) { if (!map.has(key)) map.set(key, new Set()); return map.get(key); }
-const ALLOWED_TANK_MODELS = new Set(["standard","standard2","t34","t44","t62","is3","sherman","pershing","m48patton","m48german","panther","leopard1","t29","maus","challenger1","centurion","amx30","charb1","type61","type90","type59","ztz99","strv103","cv90120","churchill","amx13","dracula"]);
+const ALLOWED_TANK_MODELS = new Set(["standard","standard2","t34","sherman","panther","m48patton","pershing","t29","is3","t44","t62","maus","leopard1","m48german","challenger1","centurion","amx30","charb1","type61","type90","type59","ztz99","strv103","cv90120","churchill","amx13","ruby","dracula","xonex"]);
 function safeTankModel(v) { const m = String(v || "standard"); return ALLOWED_TANK_MODELS.has(m) ? m : "standard"; }
 function safeTankColor(v, fallback = "#829f60") { const c = String(v || ""); return /^#[0-9a-f]{6}$/i.test(c) ? c : fallback; }
 function cleanProfile(raw, gameId, fallbackName = "Игрок") {
@@ -31,7 +31,7 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
     totalCoinsEarned: Math.max(0,Math.min(1e12,Number(raw.totalCoinsEarned)||0)),
     coins: Math.max(0,Math.min(1e12,Number(raw.coins)||0)),
     adminCoinGrantTotal: Math.max(0,Math.min(1e12,Number(raw.adminCoinGrantTotal)||0)),
-    claimedMedals: [...new Set((Array.isArray(raw.claimedMedals)?raw.claimedMedals:[]).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))].slice(0,6),
+    claimedMedals: [...new Set((Array.isArray(raw.claimedMedals)?raw.claimedMedals:(Array.isArray(raw.medals)?raw.medals:[])).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))].slice(0,6),
     selectedMedal: String(raw.selectedMedal||""),
     campaignProgress: { completed: [...new Set((Array.isArray(raw.campaignProgress?.completed)?raw.campaignProgress.completed:[]).map(Number).filter(a=>[1,2,3,4].includes(a)))].sort() },
     created: String(raw.created || new Date().toISOString()).slice(0,40),
@@ -128,7 +128,13 @@ function profileWithPresence(gameId) {
   const p=profileFor(gameId)||{gameId:String(gameId),name:"Игрок "+gameId,level:1,xp:0,kills:0,deaths:0,matches:0,playTimeSeconds:0,totalCoinsEarned:0,claimedMedals:[],selectedMedal:"",created:new Date().toISOString(),tankColor:"#829f60"};
   const room=live?.roomId?rooms.get(live.roomId):null;
   let activity=live?.activity||"В меню"; if(room) activity=room.started?"В сетевом бою":"В комнате ожидания";
-  return {...p,online:Boolean(live&&live.ws.readyState===WebSocket.OPEN),activity:live&&live.ws.readyState===WebSocket.OPEN?activity:"Не в сети",roomId:room?.id||null,roomName:room?.name||null,roomStarted:Boolean(room?.started),roomHasPassword:Boolean(room?.password)};
+  return {...p,
+    claimedMedals:[...new Set((Array.isArray(p.claimedMedals)?p.claimedMedals:[]).filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)))],
+    selectedMedal:String(p.selectedMedal||""),
+    tankModel:safeTankModel(p.tankModel||live?.tankModel||"standard"),
+    tankColor:safeTankColor(p.tankColor||live?.tankColor,"#e51f2a"),
+    selectedBarrel:String(p.selectedBarrel||"standard"),
+    online:Boolean(live&&live.ws.readyState===WebSocket.OPEN),activity:live&&live.ws.readyState===WebSocket.OPEN?activity:"Не в сети",roomId:room?.id||null,roomName:room?.name||null,roomStarted:Boolean(room?.started),roomHasPassword:Boolean(room?.password)};
 }
 function sendFriendLists(c) {
   if(!c.gameId)return;
@@ -303,7 +309,7 @@ function handleMessage(c,m) {
       if(!p.selectedMedal||!p.claimedMedals.includes(p.selectedMedal))p.selectedMedal=old?.selectedMedal||"";
       c.name=p.name;c.tankModel=safeTankModel(m.profile?.tankModel||p.tankModel);c.tankColor=safeTankColor(m.profile?.tankColor||p.tankColor,c.tankColor||"#829f60");
       if(c.roomId){const r=rooms.get(c.roomId),member=r?.players.get(c.id);if(member){member.model=c.tankModel;member.player={...(member.player||{}),model:c.tankModel,color:c.tankColor};}if(r)updateRoom(r);}
-      socialProfiles.set(c.gameId,p);persistSocial();sendFriendLists(c);break;
+      socialProfiles.set(c.gameId,p);persistSocial();sendFriendLists(c);refreshFriendsOf(c.gameId);break;
     }
     case "adminGetPlayers": { sendAdminPlayers(c,m.key,String(m.requestId||"")); break; }
     case "adminCommand": {
@@ -339,7 +345,17 @@ function handleMessage(c,m) {
         send(c.ws,{type:"adminCommandResult",ok:true,message:"Бан выдан игроку "+target.name+" (ID "+targetId+") на "+amount+" "+unit+". Причина: "+reason});
         break;
       }
-      send(c.ws,{type:"adminCommandResult",ok:false,message:"Формат: /coin число айди или /ban 1 час причина айди"});
+      const unbanMatch=command.match(/^\/unb(?:un|an)\s+(\d{9})$/i);
+      if(unbanMatch){
+        const targetId=unbanMatch[1],target=profileFor(targetId);
+        if(!target){send(c.ws,{type:"adminCommandResult",ok:false,message:"Аккаунт с таким ID не найден. Игрок должен хотя бы раз подключиться к серверу."});return;}
+        const hadBan=Boolean(target.ban&&Number(target.ban.until)>Date.now());
+        target.ban=null;persistSocial();
+        const online=idToClient.get(targetId);if(online)send(online.ws,{type:"unbanned",gameId:targetId});
+        send(c.ws,{type:"adminCommandResult",ok:true,message:hadBan?"Игрок "+target.name+" (ID "+targetId+") разбанен. Он может войти в игру.":"У игрока "+target.name+" (ID "+targetId+") активного бана нет."});
+        break;
+      }
+      send(c.ws,{type:"adminCommandResult",ok:false,message:"Формат: /coin число айди, /ban 1 час причина айди или /unbun айди"});
       break;
     }
     case "getLeaderboard": case "leaderboard": case "getTop": case "top": case "requestLeaderboard": case "getRating": case "ratingRequest": case "getTopPlayers": {
