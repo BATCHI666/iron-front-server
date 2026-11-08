@@ -37,7 +37,9 @@ function cleanProfile(raw, gameId, fallbackName = "Игрок") {
     created: String(raw.created || new Date().toISOString()).slice(0,40),
     registration: raw.registration && typeof raw.registration === "object" ? { firstSeenAt:String(raw.registration.firstSeenAt||"").slice(0,40), country:String(raw.registration.country||"Нет данных").slice(0,80), region:String(raw.registration.region||"Нет данных").slice(0,80), device:String(raw.registration.device||"Нет данных").slice(0,120), os:String(raw.registration.os||"Нет данных").slice(0,80), browser:String(raw.registration.browser||"Нет данных").slice(0,80) } : null,
     tankColor: safeTankColor(raw.tankColor,"#e51f2a"),
-    tankModel: safeTankModel(raw.tankModel)
+    tankModel: safeTankModel(raw.tankModel),
+    selectedBarrel: String(raw.selectedBarrel||"standard").slice(0,40),
+    ban: raw.ban && Number(raw.ban.until)>0 ? {until:Math.min(Date.now()+365*86400000,Number(raw.ban.until)),reason:String(raw.ban.reason||"Не указана").slice(0,200),issuedAt:String(raw.ban.issuedAt||new Date().toISOString()).slice(0,40)} : null
   };
 }
 function profileFor(id) { return socialProfiles.get(String(id)) || null; }
@@ -225,6 +227,14 @@ function handleMessage(c,m) {
   if(!m||typeof m.type!=="string")return;
   switch(m.type){
     case "hello": case "setName": {
+      const requestedGameId=String(m.gameId||"");
+      const existingBan=/^\d{9}$/.test(requestedGameId)?profileFor(requestedGameId)?.ban:null;
+      if(existingBan&&Number(existingBan.until)>Date.now()){
+        send(c.ws,{type:"banned",gameId:requestedGameId,name:profileFor(requestedGameId)?.name||m.name||"Аккаунт",until:Number(existingBan.until),reason:String(existingBan.reason||"Не указана")});
+        setTimeout(()=>{try{if(c.ws.readyState===WebSocket.OPEN)c.ws.close(4003,"Account banned");}catch{}},200);
+        return;
+      }
+      if(existingBan&&Number(existingBan.until)<=Date.now()){const oldBanProfile=profileFor(requestedGameId);if(oldBanProfile){oldBanProfile.ban=null;persistSocial();}}
       if(typeof m.name==="string"&&m.name.trim())c.name=m.name.trim().slice(0,14);
       // Sync every locally registered account, not only the currently selected/online one.
       // The browser stores multiple accounts locally; the server keeps a persistent directory.
@@ -237,6 +247,7 @@ function handleMessage(c,m) {
         if(previous){
           snapshot.created=previous.created||snapshot.created;
           snapshot.registration=previous.registration||snapshot.registration;
+          snapshot.ban=previous.ban||null;
           snapshot.playTimeSeconds=Math.max(Number(previous.playTimeSeconds)||0,Number(snapshot.playTimeSeconds)||0);
           mergeAdminCoinGrants(snapshot,previous);
           snapshot.claimedMedals=[...new Set([...(previous.claimedMedals||[]),...(snapshot.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
@@ -260,6 +271,8 @@ function handleMessage(c,m) {
           p.registration={firstSeenAt:new Date().toISOString(),country:geo.country,region:geo.region,device:device.device,os:device.os,browser:device.browser};
         } else if(old.registration) p.registration=old.registration;
         if(old){
+          p.ban=old.ban||null;
+          p.selectedBarrel=old.selectedBarrel||p.selectedBarrel;
           p.playTimeSeconds=Math.max(Number(old.playTimeSeconds)||0,Number(p.playTimeSeconds)||0);
           mergeAdminCoinGrants(p,old);
           p.claimedMedals=[...new Set([...(old.claimedMedals||[]),...(p.claimedMedals||[])])].filter(id=>["kills100","deaths50","coins10000","kills1000","coins100000","deaths100"].includes(id)).slice(0,6);
@@ -280,6 +293,8 @@ function handleMessage(c,m) {
       if(!c.gameId)return;
       const old=profileFor(c.gameId),p=cleanProfile(m.profile,c.gameId,m.name||c.name);
       p.registration=old?.registration||null;
+      p.ban=old?.ban||null;
+      p.selectedBarrel=String(m.profile?.selectedBarrel||old?.selectedBarrel||p.selectedBarrel||"standard").slice(0,40);
       p.playTimeSeconds=Math.max(Number(old?.playTimeSeconds)||0,Number(p.playTimeSeconds)||0);
       p.totalCoinsEarned=Math.max(Number(old?.totalCoinsEarned)||0,Number(p.totalCoinsEarned)||0);
       p.adminCoinGrantTotal=Math.max(Number(old?.adminCoinGrantTotal)||0,Number(p.adminCoinGrantTotal)||0);
@@ -293,18 +308,38 @@ function handleMessage(c,m) {
     case "adminGetPlayers": { sendAdminPlayers(c,m.key,String(m.requestId||"")); break; }
     case "adminCommand": {
       if(!adminAuthorized(c,m.key)){send(c.ws,{type:"adminError",message:"Доступ запрещён."});return;}
-      const command=String(m.command||"").trim(),match=command.match(/^\/coin\s+(\d{1,12})\s+(\d{9})$/i);
-      if(!match){send(c.ws,{type:"adminCommandResult",ok:false,message:"Формат команды: /coin число айди"});return;}
-      const amount=Number(match[1]),targetId=match[2];
-      if(!Number.isSafeInteger(amount)||amount<1||amount>1000000000){send(c.ws,{type:"adminCommandResult",ok:false,message:"Количество монет должно быть от 1 до 1 000 000 000."});return;}
-      const target=profileFor(targetId);
-      if(!target){send(c.ws,{type:"adminCommandResult",ok:false,message:"Аккаунт с таким ID не найден. Игрок должен хотя бы раз подключиться к серверу."});return;}
-      target.coins=Math.min(1e12,(Number(target.coins)||0)+amount);
-      target.totalCoinsEarned=Math.min(1e12,(Number(target.totalCoinsEarned)||0)+amount);
-      target.adminCoinGrantTotal=Math.min(1e12,(Number(target.adminCoinGrantTotal)||0)+amount);
-      persistSocial();
-      const online=idToClient.get(targetId);if(online)send(online.ws,{type:"adminCoinGrant",gameId:targetId,coins:target.coins,totalCoinsEarned:target.totalCoinsEarned,adminCoinGrantTotal:target.adminCoinGrantTotal});
-      send(c.ws,{type:"adminCommandResult",ok:true,message:"Выдано "+amount.toLocaleString("ru-RU")+" монет игроку "+target.name+" (ID "+targetId+")."});
+      const command=String(m.command||"").trim();
+      const coinMatch=command.match(/^\/coin\s+(\d{1,12})\s+(\d{9})$/i);
+      if(coinMatch){
+        const amount=Number(coinMatch[1]),targetId=coinMatch[2];
+        if(!Number.isSafeInteger(amount)||amount<1||amount>1000000000){send(c.ws,{type:"adminCommandResult",ok:false,message:"Количество монет должно быть от 1 до 1 000 000 000."});return;}
+        const target=profileFor(targetId);
+        if(!target){send(c.ws,{type:"adminCommandResult",ok:false,message:"Аккаунт с таким ID не найден. Игрок должен хотя бы раз подключиться к серверу."});return;}
+        target.coins=Math.min(1e12,(Number(target.coins)||0)+amount);
+        target.totalCoinsEarned=Math.min(1e12,(Number(target.totalCoinsEarned)||0)+amount);
+        target.adminCoinGrantTotal=Math.min(1e12,(Number(target.adminCoinGrantTotal)||0)+amount);
+        persistSocial();
+        const online=idToClient.get(targetId);if(online)send(online.ws,{type:"adminCoinGrant",gameId:targetId,coins:target.coins,totalCoinsEarned:target.totalCoinsEarned,adminCoinGrantTotal:target.adminCoinGrantTotal});
+        send(c.ws,{type:"adminCommandResult",ok:true,message:"Выдано "+amount.toLocaleString("ru-RU")+" монет игроку "+target.name+" (ID "+targetId+")."});
+        break;
+      }
+      const banMatch=command.match(/^\/ban\s+(\d{1,6})\s+(минут(?:а|ы)?|час(?:а|ов)?|день|дня|дней|неделя|недели|недель)\s+(.+?)\s+(\d{9})$/i);
+      if(banMatch){
+        const amount=Number(banMatch[1]),unit=banMatch[2].toLowerCase(),reason=String(banMatch[3]||"").trim().slice(0,200),targetId=banMatch[4];
+        const multiplier=unit.startsWith("мин")?60000:unit.startsWith("час")?3600000:unit.startsWith("д")?86400000:604800000;
+        const duration=amount*multiplier;
+        if(!Number.isSafeInteger(amount)||amount<1||duration>365*86400000){send(c.ws,{type:"adminCommandResult",ok:false,message:"Срок бана должен быть от 1 минуты до 365 дней."});return;}
+        if(!reason){send(c.ws,{type:"adminCommandResult",ok:false,message:"Укажи причину бана."});return;}
+        const target=profileFor(targetId);
+        if(!target){send(c.ws,{type:"adminCommandResult",ok:false,message:"Аккаунт с таким ID не найден. Игрок должен хотя бы раз подключиться к серверу."});return;}
+        const until=Date.now()+duration;
+        target.ban={until,reason,issuedAt:new Date().toISOString()};persistSocial();
+        const online=idToClient.get(targetId);
+        if(online){send(online.ws,{type:"banned",gameId:targetId,name:target.name,until,reason});setTimeout(()=>{try{if(online.ws.readyState===WebSocket.OPEN)online.ws.close(4003,"Account banned");}catch{}},200);}
+        send(c.ws,{type:"adminCommandResult",ok:true,message:"Бан выдан игроку "+target.name+" (ID "+targetId+") на "+amount+" "+unit+". Причина: "+reason});
+        break;
+      }
+      send(c.ws,{type:"adminCommandResult",ok:false,message:"Формат: /coin число айди или /ban 1 час причина айди"});
       break;
     }
     case "getLeaderboard": case "leaderboard": case "getTop": case "top": case "requestLeaderboard": case "getRating": case "ratingRequest": case "getTopPlayers": {
