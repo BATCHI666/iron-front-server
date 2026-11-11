@@ -244,7 +244,7 @@ function awardKill(room,shot,target) {
 const ADMIN_GAME_ID = "594529725";
 const ADMIN_NAME = "TALBOI";
 // Храним только SHA-256-хеш ключа: исходный секрет не попадает в исходный код.
-const ADMIN_KEY_SHA256 = "4516a6ab149747194c29325b42c047f4570890e0fb9a6deed2dd8cb3db23c8fd";
+const ADMIN_KEY_SHA256 = "532895384885285ecfdaa4db8ed41e8b28f9229d3ae6ec98e4554fa42febc0c5";
 function requestCountry(req) {
   const h=req?.headers||{};
   const code=String(h["cf-ipcountry"]||h["x-vercel-ip-country"]||"").trim().toUpperCase();
