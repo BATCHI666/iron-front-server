@@ -187,8 +187,8 @@ function sendFriendLists(c) {
 function pushFriendLists(id) { const c=idToClient.get(String(id)); if(c)sendFriendLists(c); }
 function refreshFriendsOf(id) { for(const f of getSet(friendships,String(id)))pushFriendLists(f); pushFriendLists(String(id)); }
 function roomInfo(room) {
-  const members=[...room.players.values()].map(p=>({id:p.id,name:p.name,color:p.player?.color||"#829f60",x:Number.isFinite(p.player?.x)?p.player.x:170,y:Number.isFinite(p.player?.y)?p.player.y:170,angle:Number.isFinite(p.player?.angle)?p.player.angle:0,turret:Number.isFinite(p.player?.turret)?p.player.turret:0,hp:Number.isFinite(p.player?.hp)?p.player.hp:100,maxHp:Number.isFinite(p.player?.maxHp)?p.player.maxHp:100,armor:Number.isFinite(p.player?.armor)?p.player.armor:0,model:safeTankModel(p.player?.model||p.model||"standard")}));
-  return {id:room.id,name:room.name,ownerId:room.hostId,hostId:room.hostId,players:room.players.size,playerNames:members.map(p=>p.name),hasPassword:Boolean(room.password),maxPlayers:room.maxPlayers,started:room.started,members};
+  const members=[...room.players.values()].map(p=>({id:p.id,name:p.name,team:p.team||null,color:p.player?.color||"#829f60",x:Number.isFinite(p.player?.x)?p.player.x:170,y:Number.isFinite(p.player?.y)?p.player.y:170,angle:Number.isFinite(p.player?.angle)?p.player.angle:0,turret:Number.isFinite(p.player?.turret)?p.player.turret:0,hp:Number.isFinite(p.player?.hp)?p.player.hp:100,maxHp:Number.isFinite(p.player?.maxHp)?p.player.maxHp:100,armor:Number.isFinite(p.player?.armor)?p.player.armor:0,model:safeTankModel(p.player?.model||p.model||"standard")}));
+  return {id:room.id,name:room.name,ownerId:room.hostId,hostId:room.hostId,players:room.players.size,playerNames:members.map(p=>p.name),hasPassword:Boolean(room.password),maxPlayers:room.maxPlayers,mode:room.mode||"classic",started:room.started,members};
 }
 function sendRooms(ws) { send(ws,{type:"rooms",rooms:[...rooms.values()].map(roomInfo)}); }
 function updateRoom(room) {
@@ -214,13 +214,15 @@ function joinRoom(c,requestedId,password="") {
   if(c.roomId===room.id){send(c.ws,{type:"joined",room:roomInfo(room),id:c.id});return;}
   if(c.roomId)leaveRoom(c);
   c.roomId=room.id;c.player=null;
-  room.players.set(c.id,{id:c.id,ws:c.ws,name:c.name,model:safeTankModel(c.tankModel),player:{model:safeTankModel(c.tankModel),color:safeTankColor(c.tankColor)}});
+  const cnt={blue:0,red:0};for(const q of room.players.values())if(q.team)cnt[q.team]++;
+  const newTeam=room.mode==="team"?(cnt.blue<=cnt.red?"blue":"red"):null;
+  room.players.set(c.id,{id:c.id,ws:c.ws,name:c.name,team:newTeam,model:safeTankModel(c.tankModel),player:{model:safeTankModel(c.tankModel),color:safeTankColor(c.tankColor)}});
   const info=roomInfo(room);
   send(c.ws,{type:"joined",room:info,players:info.members,id:c.id});
   broadcastRoom(room,{type:"playerJoined",id:c.id,playerId:c.id,player:{id:c.id,name:c.name},name:c.name,room:info},c.id);
   updateRoom(room);
   if(c.gameId)refreshFriendsOf(c.gameId);
-  if(room.started){const players=[...room.players.values()].map((p,i)=>({id:p.id,name:p.name,color:safeTankColor(p.player?.color||"#829f60"),model:safeTankModel(p.player?.model||p.model),x:Number.isFinite(p.player?.x)?p.player.x:170+(i%4)*85,y:Number.isFinite(p.player?.y)?p.player.y:170+Math.floor(i/4)*85,angle:p.player?.angle||0,turret:p.player?.turret||0,hp:Number.isFinite(p.player?.hp)?p.player.hp:100,maxHp:Number.isFinite(p.player?.maxHp)?p.player.maxHp:100,armor:p.player?.armor||0}));send(c.ws,{type:"started",roomId:room.id,players});}
+  if(room.started){const players=[...room.players.values()].map((p,i)=>({id:p.id,name:p.name,team:p.team||null,color:safeTankColor(p.player?.color||"#829f60"),model:safeTankModel(p.player?.model||p.model),x:Number.isFinite(p.player?.x)?p.player.x:170+(i%4)*85,y:Number.isFinite(p.player?.y)?p.player.y:170+Math.floor(i/4)*85,angle:p.player?.angle||0,turret:p.player?.turret||0,hp:Number.isFinite(p.player?.hp)?p.player.hp:100,maxHp:Number.isFinite(p.player?.maxHp)?p.player.maxHp:100,armor:p.player?.armor||0}));send(c.ws,{type:"started",mode:room.mode||"classic",roomId:room.id,players});}
 }
 function startGame(c) {
   const room=rooms.get(c.roomId);
@@ -229,12 +231,21 @@ function startGame(c) {
   if(room.started)return sendError(c,"Бой уже начался.");
   room.started=true;room.claimedCoins=new Set();room.claimedPickups=new Set();room.chatMessageIds=new Set();room.shots=new Map();
   const members=[...room.players.values()];
-  const players=members.map((p,i)=>{const maxHp=Math.max(1,Math.min(1000,Number(p.player?.maxHp)||100));const state={id:p.id,name:p.name,color:safeTankColor(p.player?.color||"#829f60"),model:safeTankModel(p.player?.model||p.model),x:170+(i%4)*85,y:170+Math.floor(i/4)*85,angle:0,turret:0,hp:maxHp,maxHp,armor:Math.max(0,Number(p.player?.armor)||0),dead:false};p.player=state;return state;});
-  broadcastRoom(room,{type:"started",roomId:room.id,players});updateRoom(room);
+  const players=members.map((p,i)=>{const maxHp=Math.max(1,Math.min(1000,Number(p.player?.maxHp)||100));const state={id:p.id,name:p.name,team:p.team||null,color:safeTankColor(p.player?.color||"#829f60"),model:safeTankModel(p.player?.model||p.model),x:170+(i%4)*85,y:170+Math.floor(i/4)*85,angle:0,turret:0,hp:maxHp,maxHp,armor:Math.max(0,Number(p.player?.armor)||0),dead:false};p.player=state;return state;});
+  broadcastRoom(room,{type:"started",mode:room.mode||"classic",roomId:room.id,players});updateRoom(room);
   for(const p of room.players.values()){const x=clients.get(p.id);if(x?.gameId)refreshFriendsOf(x.gameId);}
 }
 function safeNumber(v,def=0){return typeof v==="number"&&Number.isFinite(v)?v:def;}
 function awardKill(room,shot,target) {
+  if(room.mode==="team"){
+    const sh=room.players.get(shot.shooterId);
+    if(sh?.team){
+      if(!room.score)room.score={blue:0,red:0};
+      room.score[sh.team]++;
+      broadcastRoom(room,{type:"teamScore",blue:room.score.blue,red:room.score.red});
+      if(room.score[sh.team]>=20){broadcastRoom(room,{type:"teamWin",team:sh.team,blue:room.score.blue,red:room.score.red});room.score={blue:0,red:0};broadcastRoom(room,{type:"teamScore",blue:0,red:0});}
+    }
+  }
   const shooterClient=clients.get(shot.shooterId), victimClient=clients.get(target.id);
   if(shooterClient?.gameId){const p=profileFor(shooterClient.gameId);if(p){p.kills=Math.min(1e9,(Number(p.kills)||0)+1);persistSocial();}}
   if(victimClient?.gameId){const p=profileFor(victimClient.gameId);if(p){p.deaths=Math.min(1e9,(Number(p.deaths)||0)+1);persistSocial();}}
@@ -469,9 +480,10 @@ function handleMessage(c,m) {
     case "getRooms": case "listRooms": sendRooms(c.ws);break;
     case "createRoom": {
       const name=String(m.name||m.roomName||"").trim().slice(0,28);if(!name){sendError(c,"Введи название комнаты.");return;}if(c.roomId)leaveRoom(c);
-      const maxPlayers=Math.max(2,Math.min(12,Number(m.maxPlayers)||4)),password=String(m.password||"").slice(0,40),id=randomUUID().slice(0,8);
-      const room={id,name,password,hostId:c.id,maxPlayers,players:new Map(),started:false,shots:new Map()};rooms.set(id,room);c.roomId=id;c.player=null;
-      room.players.set(c.id,{id:c.id,ws:c.ws,name:c.name,model:safeTankModel(c.tankModel),player:{model:safeTankModel(c.tankModel),color:safeTankColor(c.tankColor)}});
+      const mode=["classic","team"].includes(m.mode)?m.mode:(m.mode==="bots"?"bots":"classic");if(mode==="bots"){sendError(c,"Режим «Бой с ботами» пока недоступен.");return;}
+      const maxPlayers=Math.max(1,Math.min(6,Math.floor(Number(m.maxPlayers))||4)),password=String(m.password||"").slice(0,40),id=randomUUID().slice(0,8);
+      const room={id,name,password,hostId:c.id,maxPlayers,mode,score:{blue:0,red:0},players:new Map(),started:false,shots:new Map()};rooms.set(id,room);c.roomId=id;c.player=null;
+      room.players.set(c.id,{id:c.id,ws:c.ws,name:c.name,team:mode==="team"?"blue":null,model:safeTankModel(c.tankModel),player:{model:safeTankModel(c.tankModel),color:safeTankColor(c.tankColor)}});
       const info=roomInfo(room);send(c.ws,{type:"roomCreated",room:info,roomId:id});send(c.ws,{type:"joined",room:info,players:info.members,id:c.id});updateRoom(room);startGame(c);break;
     }
     case "joinRoom": joinRoom(c,m.roomId||m.id||m.room,m.password||"");break;
@@ -481,7 +493,7 @@ function handleMessage(c,m) {
       const room=rooms.get(c.roomId);if(!room||!room.started||!m.player||!room.players.has(c.id))return;
       const p=m.player,valid=v=>typeof v==="number"&&Number.isFinite(v);if(!valid(p.x)||!valid(p.y)||Math.abs(p.x)>10000||Math.abs(p.y)>10000)return;
       const member=room.players.get(c.id),old=member.player||{};
-      const state={x:p.x,y:p.y,angle:valid(p.angle)?p.angle:0,turret:valid(p.turret)?p.turret:0,hp:Math.max(0,Number(old.hp??100)),maxHp:Math.max(1,Math.min(1000,valid(p.maxHp)?p.maxHp:(Number(old.maxHp)||100))),armor:Math.max(0,Math.min(100,Number(old.armor)||0)),dead:Boolean(old.dead),name:c.name,color:safeTankColor(p.color,c.tankColor||"#829f60"),model:safeTankModel(p.model||c.tankModel||"standard")};
+      const state={x:p.x,y:p.y,angle:valid(p.angle)?p.angle:0,turret:valid(p.turret)?p.turret:0,hp:Math.max(0,Number(old.hp??100)),maxHp:Math.max(1,Math.min(1000,valid(p.maxHp)?p.maxHp:(Number(old.maxHp)||100))),armor:Math.max(0,Math.min(100,Number(old.armor)||0)),dead:Boolean(old.dead),name:c.name,team:member.team||null,color:safeTankColor(p.color,c.tankColor||"#829f60"),model:safeTankModel(p.model||c.tankModel||"standard")};
       c.tankModel=state.model;c.tankColor=state.color;c.player=state;member.player=state;
       broadcastRoom(room,{type:"state",id:c.id,playerId:c.id,player:state},c.id);break;
     }
@@ -500,6 +512,7 @@ function handleMessage(c,m) {
       // Разрешаем подтверждение попадания только стрелявшему или получившему снаряд.
       if(c.id!==shot.shooterId&&c.id!==targetId)return;
       const shooter=room.players.get(shot.shooterId);if(!shooter?.player||!target.player||target.player.dead||Number(target.player.hp)<=0)return;
+      if(room.mode==="team"&&shooter.team&&shooter.team===target.team)return;
       shot.resolved=true;
       let damage=shot.damage;const armor=Math.max(0,Number(target.player.armor)||0),absorbed=Math.min(armor,damage);target.player.armor=armor-absorbed;damage-=absorbed;
       target.player.hp=Math.max(0,Number(target.player.hp)-damage);
@@ -522,7 +535,7 @@ function handleMessage(c,m) {
       const member=room.players.get(c.id);if(!member)return;
       if(!member.player?.dead&&Number(member.player?.hp)>0)return;
       const maxHp=Math.max(1,Math.min(1000,Number(member.player?.maxHp)||Number(p.maxHp)||100));
-      const state={x:Math.max(-10000,Math.min(10000,p.x)),y:Math.max(-10000,Math.min(10000,p.y)),angle:Number.isFinite(p.angle)?p.angle:0,turret:Number.isFinite(p.turret)?p.turret:0,hp:maxHp,maxHp,armor:0,dead:false,name:c.name,color:safeTankColor(p.color,c.tankColor||"#829f60"),model:safeTankModel(p.model||c.tankModel||"standard")};
+      const state={x:Math.max(-10000,Math.min(10000,p.x)),y:Math.max(-10000,Math.min(10000,p.y)),angle:Number.isFinite(p.angle)?p.angle:0,turret:Number.isFinite(p.turret)?p.turret:0,hp:maxHp,maxHp,armor:0,dead:false,name:c.name,team:member.team||null,color:safeTankColor(p.color,c.tankColor||"#829f60"),model:safeTankModel(p.model||c.tankModel||"standard")};
       member.player=state;c.player=state;broadcastRoom(room,{type:"respawn",id:c.id,player:state});break;
     }
     case "coinCollect": {
